@@ -33,7 +33,6 @@ jobs:
           path: |
             ~/.config/google-chrome
             ~/.cache/selenium
-            saved_cookies.pkl
           key: ${{ runner.os }}-browser-cache-${{ hashFiles('**/HidenCloud_Renew.yml') }}
           restore-keys: |
             ${{ runner.os }}-browser-cache-
@@ -41,7 +40,6 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install seleniumbase requests bs4
-          # 安装 SeleniumBase 浏览器隔离所需的运行环境
           seleniumbase install chromedriver
 
       - name: Setup Xray Proxy Node
@@ -100,7 +98,7 @@ jobs:
                   f.write(url.split("#")[0])
               sys.exit(0)
           else:
-              print(f"[ERROR] 不不支持的协议: {url.split('://')[0]}")
+              print(f"[ERROR] 不支持的协议: {url.split('://')[0]}")
               sys.exit(1)
 
           if "#" in content:
@@ -239,7 +237,7 @@ jobs:
 
       - name: Run HidenCloud Renew Script
         env:
-          HIDENCLOUD: ${{ secrets.HIDENCLOUD }}
+          HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
@@ -254,7 +252,6 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # 判断文件是否有改动再提交，避免无变化报错中断
           if ! git diff --exit-code .github/workflows/HidenCloud_Renew.yml; then
             git add .github/workflows/HidenCloud_Renew.yml
             git commit -m "chore: 智能调整下次自动续期时间规则 [skip ci]"
