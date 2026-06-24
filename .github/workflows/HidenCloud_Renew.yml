@@ -1,270 +1,176 @@
-name: HidenCloud 自动续期
+import os
+import sys
+import re
+import time
+import datetime
+import requests
+from seleniumbase import Driver
 
-on:
-  schedule:
-    # 初始每日执行一次（随后脚本会自动修改这里的 Cron 精准控制时间）
-    - cron: '0 4 * * *'
-  workflow_dispatch:
+def send_telegram_notification(token, chat_id, message, screenshot_path=None):
+    if not token or not chat_id:
+        print("[INFO] 未配置 Telegram 推送参数，跳过通知。")
+        return
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+        if screenshot_path and os.path.exists(screenshot_path):
+            photo_url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            with open(screenshot_path, 'rb') as f:
+                requests.post(photo_url, data={"chat_id": chat_id}, files={"photo": f}, timeout=15)
+        print("[INFO] Telegram 通知发送成功。")
+    except Exception as e:
+        print(f"[WARN] Telegram 推送失败: {e}")
 
-permissions:
-  contents: write
-  actions: write
+def update_github_cron(days_remaining):
+    """
+    智能分析计算剩余到期天数，提早 20 小时修改工作流 yml
+    """
+    if days_remaining <= 0:
+        print("[WARN] 无法计算非法剩余天数，放弃时间重写。")
+        return
+        
+    now = datetime.datetime.utcnow()
+    # 提前 20 小时运行
+    target_time = now + datetime.timedelta(days=days_remaining) - datetime.timedelta(hours=20)
+    
+    new_cron = f"{target_time.minute} {target_time.hour} {target_time.day} {target_time.month} *"
+    print(f"[INFO] 智能计算下次执行 UTC 时间为: {target_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[INFO] 生成的目标 Cron 表达式: '{new_cron}'")
+    
+    yml_path = ".github/workflows/HidenCloud_Renew.yml"
+    if os.path.exists(yml_path):
+        with open(yml_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        updated_content = re.sub(r"- cron:\s*'[^']+'", f"- cron: '{new_cron}'", content, count=1)
+        
+        with open(yml_path, "w", encoding="utf-8") as f:
+            f.write(updated_content)
+        print("[INFO] 成功在本地修改工作流 Cron 表达式")
+    else:
+        print("[WARN] 未找到工作流文件，本地跳过修改")
 
-jobs:
-  renew:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+def parse_raw_cookie(raw_cookie_str):
+    """
+    解析从开发者工具里复制出来的原始 Cookie 字符串
+    """
+    cookie_list = []
+    # 移除可能存在的开头的 "Cookie: " 标签
+    if raw_cookie_str.startswith("Cookie:"):
+        raw_cookie_str = raw_cookie_str[7:]
+        
+    pairs = raw_cookie_str.strip().split(";")
+    for pair in pairs:
+        if "=" in pair:
+            key, value = pair.split("=", 1)
+            cookie_list.append({
+                "name": key.strip(),
+                "value": value.strip(),
+                "domain": "dash.hidencloud.com",
+                "path": "/"
+            })
+    return cookie_list
 
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
+def main():
+    raw_cookie = os.environ.get("HIDEN_COOKIE", "").strip()
+    tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    tg_chat_id = os.environ.get("TG_CHAT_ID", "").strip()
+    proxy_server = os.environ.get("PROXY_SERVER", "").strip()
+    proxy_port = os.environ.get("PROXY_SOCKS5_PORT", "").strip()
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+    if not raw_cookie:
+        print("[ERROR] 未配置 HIDEN_COOKIE 变量，请检查 GitHub Repository Secrets")
+        sys.exit(1)
 
-      - name: Setup Chrome & Cache
-        uses: actions/cache@v4
-        id: browser-cache
-        with:
-          path: |
-            ~/.config/google-chrome
-            ~/.cache/selenium
-          key: ${{ runner.os }}-browser-cache-${{ hashFiles('**/HidenCloud_Renew.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-browser-cache-
+    print("[INFO] 🚀 启动 HidenCloud 服务器自动化续期（Cookie 会话模式）")
 
-      - name: Install Dependencies
-        run: |
-          pip install seleniumbase requests bs4
-          seleniumbase install chromedriver
+    # 初始化配置浏览器
+    driver_kwargs = {
+        "browser": "chrome",
+        "headless": True,
+        "uc": True,
+        "incognito": False
+    }
 
-      - name: Setup Xray Proxy Node
-        env:
-          PROXY_NODE: ${{ secrets.PROXY_NODE }}
-        run: |
-          if [ -z "$PROXY_NODE" ]; then
-            echo "[INFO] 未检测到 PROXY_NODE 变量，将采用直连模式运行。"
-            exit 0
-          fi
+    if proxy_server:
+        print(f"[INFO] 正在挂载本地代理环境: socks5://127.0.0.1:{proxy_port}")
+        driver_kwargs["proxy"] = f"127.0.0.1:{proxy_port}"
 
-          echo "[INFO] 正在下载 Xray 核心..."
-          mkdir -p xray
-          curl -L -s https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
-          unzip -q xray.zip -d xray
-          chmod +x ./xray/xray
+    driver = Driver(**driver_kwargs)
+    driver.set_window_size(1366, 768)
 
-          echo "[INFO] 正在解析代理节点配置..."
-          python3 - << 'PYEOF'
-          import os
-          import sys
-          import json
-          import base64
-          from urllib.parse import parse_qs, unquote
+    try:
+        # 必须先访问一次域名，浏览器才能接受该域名的 Cookie 注入
+        driver.get("https://dash.hidencloud.com/login")
+        time.sleep(3)
 
-          def mask(s):
-              if len(s) <= 6: return "***"
-              return s[:3] + "***" + s[-3:]
+        print("[INFO] 正在解析并注入配置的 Cookie...")
+        parsed_cookies = parse_raw_cookie(raw_cookie)
+        for cookie in parsed_cookies:
+            try:
+                driver.add_cookie(cookie)
+            except Exception as e:
+                print(f"[WARN] 注入 Cookie 项失败 [{cookie.get('name')}]: {e}")
 
-          url = os.environ.get("PROXY_NODE", "").strip()
-          if not url:
-              print("[ERROR] PROXY_NODE 为空")
-              sys.exit(1)
+        # 注入后直接跳转到 VPS 控制台主页
+        print("[INFO] 正在携 Cookie 会话凭证跳转控制台...")
+        driver.get("https://dash.hidencloud.com/vps")
+        time.sleep(8)
 
-          if url.startswith("vless://"):
-              protocol = "vless"
-              content = url[8:]
-          elif url.startswith("vmess://"):
-              protocol = "vmess"
-              content = url[8:]
-          elif url.startswith("trojan://"):
-              protocol = "trojan"
-              content = url[9:]
-          elif url.startswith("ss://"):
-              protocol = "ss"
-              content = url[5:]
-          elif url.startswith("socks5://") or url.startswith("socks://"):
-              protocol = "socks5"
-              content = url.split("://")[1].split("#")[0]
-              if "@" in content:
-                  server = content.split("@")[1].split(":")[0]
-              else:
-                  server = content.split(":")[0]
-              print(f"[INFO] SOCKS5 -> {mask(server)}")
-              with open("use_external_socks.txt", "w") as f:
-                  f.write(url.split("#")[0])
-              sys.exit(0)
-          else:
-              print(f"[ERROR] 不支持的协议: {url.split('://')[0]}")
-              sys.exit(1)
+        # 强校验：如果页面仍然重定向到了登录页，说明 Cookie 已经彻底失效
+        if "login" in driver.current_url.lower():
+            print("[ERROR] ❌ 会话注入失败或 Cookie 已过期，被重定向至登录页面")
+            driver.save_screenshot("cookie_expired.png")
+            send_telegram_notification(tg_token, tg_chat_id, "❌ HidenCloud 自动续期失败：Cookie 已过期失效，请重新抓取更新。", "cookie_expired.png")
+            sys.exit(1)
 
-          if "#" in content:
-              content = content.rsplit("#", 1)[0]
+        print("[INFO] 🎉 成功识别有效的 Cookie 登录状态")
 
-          config = {
-              "log": {"loglevel": "warning"},
-              "inbounds": [
-                  {"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}},
-                  {"port": 1081, "listen": "127.0.0.1", "protocol": "http"}
-              ],
-              "outbounds": []
-          }
+        # 使用 BeautifulSoup 提取页面上的到期天数
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        
+        days_text = soup.find(text=re.compile(r"(\d+)\s*days?\s*(remaining|expires)", re.I))
+        days_remaining = 7 # 默认缺省值
+        
+        if days_text:
+            match = re.search(r"(\d+)", days_text)
+            if match:
+                days_remaining = int(match.group(1))
+                print(f"[INFO] 智能识别当前的服务器剩余健康天数: {days_remaining} 天")
 
-          if protocol == "vless":
-              uuid, rest = content.split("@", 1)
-              host_port, params_str = rest.split("?", 1) if "?" in rest else (rest, "")
-              address, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
-              params = parse_qs(params_str)
-              
-              security = params.get("security", ["none"])[0]
-              network = params.get("type", ["tcp"])[0]
-              sni = params.get("sni", [address])[0]
-              fp = params.get("fp", ["chrome"])[0]
-              flow = params.get("flow", [""])[0]
-              pbk = params.get("pbk", [""])[0]
-              host = params.get("host", [sni])[0]
-              path = unquote(params.get("path", ["/"])[0])
+        # 检索并执行续期按钮点击
+        renew_buttons = [btn for btn in driver.find_elements("button") if "renew" in btn.text.lower() or "续期" in btn.text]
+        
+        if renew_buttons:
+            renew_buttons[0].click()
+            print("[INFO] 成功点击续期按钮，等待系统响应...")
+            time.sleep(6)
+            
+            driver.save_screenshot("renew_success.png")
+            success_msg = f"✅ HidenCloud 续期请求已触发成功！\n📊 运行前识别到期剩余: `{days_remaining}` 天。"
+            print(f"[INFO] {success_msg}")
+            
+            send_telegram_notification(tg_token, tg_chat_id, success_msg, "renew_success.png")
+            update_github_cron(days_remaining)
+        else:
+            print("[WARN] ⚠️ 页面未检索到可点击的续期按钮，可能当前时间不满足续期条件。")
+            driver.save_screenshot("no_button_available.png")
+            send_telegram_notification(tg_token, tg_chat_id, f"⚠️ HidenCloud 脚本已运行，但当前面板无有效续期按钮（当前剩余 `{days_remaining}` 天）。", "no_button_available.png")
+            update_github_cron(days_remaining)
 
-              print(f"[INFO] VLESS -> {mask(address)}:{port}")
-              outbound = {
-                  "protocol": "vless",
-                  "settings": {"vnext": [{"address": address, "port": int(port), "users": [{"id": uuid, "encryption": "none"}]}]},
-                  "streamSettings": {"network": network, "security": security}
-              }
-              if flow: outbound["settings"]["vnext"][0]["users"][0]["flow"] = flow
-              if security == "reality":
-                  outbound["streamSettings"]["realitySettings"] = {"serverName": sni, "fingerprint": fp, "publicKey": pbk}
-              elif security == "tls":
-                  outbound["streamSettings"]["tlsSettings"] = {"serverName": sni, "fingerprint": fp, "allowInsecure": False}
-              if network == "ws": outbound["streamSettings"]["wsSettings"] = {"path": path, "headers": {"Host": host}}
-              elif network == "grpc": outbound["streamSettings"]["grpcSettings"] = {"serviceName": params.get("serviceName", [""])[0]}
-              config["outbounds"].append(outbound)
+    except Exception as e:
+        print(f"[ERROR] 脚本运行发生异常: {e}")
+        try:
+            driver.save_screenshot("error_exception.png")
+            send_telegram_notification(tg_token, tg_chat_id, f"💥 HidenCloud 脚本异常中断: {str(e)[:100]}", "error_exception.png")
+        except:
+            pass
+        sys.exit(1)
+    finally:
+        driver.quit()
 
-          elif protocol == "vmess":
-              try:
-                  padding = 4 - len(content) % 4
-                  if padding != 4: content += "=" * padding
-                  vm = json.loads(base64.b64decode(content).decode("utf-8"))
-              except Exception as e:
-                  print(f"[ERROR] VMess 解析失败: {e}"); sys.exit(1)
-              
-              address, port, uuid = vm.get("add", ""), int(vm.get("port", 443)), vm.get("id", "")
-              network, tls = vm.get("net", "tcp"), vm.get("tls", "")
-              print(f"[INFO] VMess -> {mask(address)}:{port}")
-              outbound = {
-                  "protocol": "vmess",
-                  "settings": {"vnext": [{"address": address, "port": port, "users": [{"id": uuid, "alterId": int(vm.get("aid", 0)), "security": "auto"}]}]},
-                  "streamSettings": {"network": network, "security": "tls" if tls == "tls" else "none"}
-              }
-              if tls == "tls":
-                  outbound["streamSettings"]["tlsSettings"] = {"serverName": vm.get("sni", "") or vm.get("host", address), "fingerprint": vm.get("fp", "chrome"), "allowInsecure": False}
-              if network == "ws":
-                  outbound["streamSettings"]["wsSettings"] = {"path": vm.get("path", "/"), "headers": {"Host": vm.get("host", address)}}
-              config["outbounds"].append(outbound)
-
-          elif protocol == "trojan":
-              password, rest = content.split("@", 1)
-              host_port, params_str = rest.split("?", 1) if "?" in rest else (rest, "")
-              address, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
-              params = parse_qs(params_str)
-              
-              print(f"[INFO] Trojan -> {mask(address)}:{port}")
-              outbound = {
-                  "protocol": "trojan",
-                  "settings": {"servers": [{"address": address, "port": int(port), "password": password}]},
-                  "streamSettings": {
-                      "network": params.get("type", ["tcp"])[0], "security": "tls",
-                      "tlsSettings": {"serverName": params.get("sni", [address])[0], "fingerprint": params.get("fp", ["chrome"])[0], "allowInsecure": False}
-                  }
-              }
-              if params.get("type", ["tcp"])[0] == "ws":
-                  outbound["streamSettings"]["wsSettings"] = {"path": unquote(params.get("path", ["/"])[0]), "headers": {"Host": params.get("host", [address])[0]}}
-              config["outbounds"].append(outbound)
-
-          elif protocol == "ss":
-              try:
-                  if "@" in content:
-                      encoded, server_part = content.split("@", 1)
-                      method, password = base64.b64decode(encoded + "==").decode("utf-8").split(":", 1)
-                      address, port = server_part.split(":", 1)
-                  else:
-                      user_part, server_part = base64.b64decode(content + "==").decode("utf-8").split("@", 1)
-                      method, password = user_part.split(":", 1)
-                      address, port = server_part.split(":", 1)
-              except Exception as e:
-                  print(f"[ERROR] Shadowsocks 解析失败: {e}"); sys.exit(1)
-
-              print(f"[INFO] Shadowsocks -> {mask(address)}:{port}")
-              config["outbounds"].append({
-                  "protocol": "shadowsocks",
-                  "settings": {"servers": [{"address": address, "port": int(port), "method": method, "password": password}]}
-              })
-
-          with open("xray_config.json", "w") as f:
-              json.dump(config, f, indent=2)
-          print("[INFO] ✅ 代理配置已成功生成")
-          PYEOF
-
-          if [ -f "use_external_socks.txt" ]; then
-            EXTERNAL_SOCKS=$(cat use_external_socks.txt)
-            echo "PROXY_SERVER=$EXTERNAL_SOCKS" >> $GITHUB_ENV
-            echo "PROXY_SOCKS5_PORT=$(echo $EXTERNAL_SOCKS | rsplit ':' 1)" >> $GITHUB_ENV
-            echo "[INFO] ✅ 使用外部 SOCKS5 代理"
-            exit 0
-          fi
-
-          ./xray/xray run -c xray_config.json > xray.log 2>&1 &
-          sleep 5
-
-          echo "[INFO] 测试代理连接..."
-          for i in 1 2 3 4 5; do
-            if curl -x socks5://127.0.0.1:1080 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
-              echo "[INFO] ✅ 代理连接成功"
-              echo "PROXY_SERVER=127.0.0.1:1080" >> $GITHUB_ENV
-              echo "PROXY_SOCKS5_PORT=1080" >> $GITHUB_ENV
-              exit 0
-            fi
-            echo "[WARN] 尝试连接 $i/5..."
-            sleep 3
-          done
-
-          echo "[ERROR] ❌ 代理连接失败"
-          cat xray.log
-          exit 1
-
-      - name: Run HidenCloud Renew Script
-        env:
-          HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_SERVER: ${{ env.PROXY_SERVER }}
-          PROXY_SOCKS5_PORT: ${{ env.PROXY_SOCKS5_PORT }}
-        run: |
-          python hidencloud_renew.py
-
-      - name: Auto Push Git Update (Cron Adjust)
-        env:
-          GITHUB_TOKEN: ${{ secrets.REPO_TOKEN }}
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          if ! git diff --exit-code .github/workflows/HidenCloud_Renew.yml; then
-            git add .github/workflows/HidenCloud_Renew.yml
-            git commit -m "chore: 智能调整下次自动续期时间规则 [skip ci]"
-            git push origin HEAD:${{ github.ref_name }}
-            echo "[INFO] ✅ 下次定时运行时间已成功持久化更新"
-          else
-            echo "[INFO] 时间间隔未变动，无需提交。"
-          fi
-
-      - name: Cleanup Workflow History
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.REPO_TOKEN }}
-          repository: ${{ github.repository }}
-          retain_days: 0
-          keep_minimum_runs: 2
+if __name__ == "__main__":
+    main()
