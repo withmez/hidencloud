@@ -4,10 +4,12 @@ import os
 import re
 import time
 import base64
+from urllib.parse import parse_qs, unquote, urlparse
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
-# 为了加密 GitHub Secret
+# 尝试导入加密库
 try:
     from nacl import encoding, public
     HAS_NACL = True
@@ -17,487 +19,386 @@ except ImportError:
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - [%(levelname)s] - %(message)s'
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("HidenCloud")
 
-class HidenCloud:
-    def __init__(self, cookie_str, tg_config=None, proxy_dict=None):
+def escape_markdown(text):
+    """转义 Markdown 特殊字符，防止 TG 报错 can't parse entities"""
+    if not text:
+        return ""
+    # 转义 MarkdownV1/V2 或标准解析中容易崩的字符，特别是下划线和星号的错位
+    escape_chars = r'_*`['
+    return re.sub(r'([%s])' % re.escape(escape_chars), r'\\\1', str(text))
+
+class HidenCloudBot:
+    def __init__(self, cookie_str, tg_config=None, proxy_dict=None, account_idx=1):
         self.base_url = "https://dash.hidencloud.com"
         self.cookie_str = cookie_str
         self.tg_config = tg_config
         self.proxy_dict = proxy_dict
-        self.session = requests.Session(impersonate="chrome110")
+        self.account_idx = account_idx
         
-        # 注入代理配置
+        # 统一升级至最新的真实浏览器指纹 chrome136
+        self.session = requests.Session(impersonate="chrome136")
         if self.proxy_dict:
             self.session.proxies = self.proxy_dict
             
-        self.username = "Unknown"
+        self.username = f"Account_{account_idx}"
         self.balance = "未知"
-        self.updated_cookies = False
         self.csrf_token = ""
         self.parse_and_set_cookies()
 
     def parse_and_set_cookies(self):
-        """解析 Cookie 字符串并设置到 Session"""
-        if not self.cookie_str:
-            return
-        
         cookies = {}
         for item in self.cookie_str.split(';'):
             if '=' in item:
                 parts = item.strip().split('=', 1)
                 if len(parts) == 2:
-                    key, value = parts
-                    cookies[key] = value
+                    cookies[parts[0]] = parts[1]
         self.session.cookies.update(cookies)
 
     def get_cookie_string(self):
-        """获取当前的 Cookie 字符串 (确保捕获所有域名的 Cookie)"""
-        cookie_list = []
-        for name, value in self.session.cookies.items():
-            cookie_list.append(f"{name}={value}")
-        return "; ".join(cookie_list)
+        return "; ".join([f"{k}={v}" for k, v in self.session.cookies.items()])
 
     def update_github_secret(self, new_cookie):
-        """自动更新 GitHub Secret"""
+        """反向回写更新 GitHub Secret，保持 Cookie 长效接力"""
         gh_pat = os.environ.get("GH_PAT")
         repo = os.environ.get("GITHUB_REPOSITORY")
-        secret_name = "HIDEN_COOKIE"
-
         if not gh_pat or not repo:
-            logger.warning("未找到 GH_PAT 或 GITHUB_REPOSITORY，跳过 Secret 更新")
             return
-
         if not HAS_NACL:
-            logger.error("未安装 pynacl 库，无法加密并更新 Secret")
+            logger.error(f"[{self.username}] 未安装 pynacl 库，无法自动同步 Secret")
             return
 
-        logger.info(f"正在尝试更新 GitHub Secret: {secret_name}")
         headers = {
             "Authorization": f"token {gh_pat}",
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "HidenCloud-Renew-Bot"
         }
-
         try:
             # 1. 获取公钥
-            pub_key_resp = requests.get(
-                f"https://api.github.com/repos/{repo}/actions/secrets/public-key",
-                headers=headers
-            )
-            if pub_key_resp.status_code != 200:
-                logger.error(f"获取公钥失败: {pub_key_resp.text}")
-                return
+            res = requests.get(f"https://api.github.com/repos/{repo}/actions/secrets/public-key", headers=headers)
+            if res.status_code != 200: return
+            pub_data = res.json()
             
-            pub_key_data = pub_key_resp.json()
-            public_key = pub_key_data['key']
-            key_id = pub_key_data['key_id']
+            # 2. 加密
+            public_key = public.PublicKey(pub_data['key'].encode("utf-8"), encoding.Base64Encoder())
+            sealed_box = public.SealedBox(public_key)
+            encrypted_value = base64.b64encode(sealed_box.encrypt(new_cookie.encode("utf-8"))).decode("utf-8")
 
-            # 2. 加密 Secret
-            def encrypt(public_key: str, secret_value: str) -> str:
-                public_key_obj = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder())
-                sealed_box = public.SealedBox(public_key_obj)
-                encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
-                return base64.b64encode(encrypted).decode("utf-8")
-
-            encrypted_value = encrypt(public_key, new_cookie)
-
-            # 3. 提交更新
-            put_resp = requests.put(
-                f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}",
+            # 3. 提交
+            requests.put(
+                f"https://api.github.com/repos/{repo}/actions/secrets/HIDEN_COOKIE",
                 headers=headers,
-                json={
-                    "encrypted_value": encrypted_value,
-                    "key_id": key_id
-                }
+                json={"encrypted_value": encrypted_value, "key_id": pub_data['key_id']}
             )
-            if put_resp.status_code in [201, 204]:
-                logger.info(f"✅ GitHub Secret {secret_name} 更新成功！")
-            else:
-                logger.error(f"❌ 更新 Secret 失败: {put_resp.text}")
-
+            logger.info(f" [{self.username}] ✅ GitHub Secret (HIDEN_COOKIE) 自动同步成功！")
         except Exception as e:
-            logger.error(f"更新 Secret 过程出错: {e}")
+            logger.error(f"[{self.username}] 同步 Secret 异常: {e}")
 
     def get_hitokoto(self):
-        """获取每日一言"""
         try:
-            resp = requests.get("https://v1.hitokoto.cn/?encode=json", timeout=10)
+            resp = requests.get("https://v1.hitokoto.cn/?encode=json", timeout=5)
             if resp.status_code == 200:
-                data = resp.json()
-                return f"『{data['hitokoto']}』—— {data['from']}"
+                return f"『{resp.json()['hitokoto']}』—— {resp.json()['from']}"
         except Exception:
             pass
         return "保持热爱，奔赴山海。"
 
     def send_tg_notification(self, message):
-        """发送 Telegram 通知"""
         if not self.tg_config or not self.tg_config.get("bot_token") or not self.tg_config.get("chat_id"):
             return
-
         url = f"https://api.telegram.org/bot{self.tg_config['bot_token']}/sendMessage"
-        hitokoto = self.get_hitokoto()
         
+        # 严格保护排版和 Markdown 转义
         formatted_message = (
-            f"☁️ **HidenCloud 自动续费任务**\n"
+            f"☁️ **HidenCloud 续费报告**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"👤 **账号**: `{self.username}`\n"
-            f"💰 **余额**: `{self.balance}`\n"
+            f"👤 **账号**: `{escape_markdown(self.username)}`\n"
+            f"💰 **余额**: `{escape_markdown(self.balance)}`\n"
             f"🕒 **时间**: `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{message}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"💡 **每日一言**:\n_{hitokoto}_"
+            f"💡 **每日一言**:\n_{escape_markdown(self.get_hitokoto())}_"
         )
-
-        payload = {
-            "chat_id": self.tg_config["chat_id"],
-            "text": formatted_message,
-            "parse_mode": "Markdown"
-        }
         try:
-            resp = requests.post(url, json=payload, timeout=10)
-            if resp.status_code == 200:
-                logger.info("Telegram 通知发送成功")
-            else:
-                logger.error(f"Telegram 通知发送失败: {resp.text}")
+            requests.post(url, json={"chat_id": self.tg_config["chat_id"], "text": formatted_message, "parse_mode": "Markdown"}, timeout=10)
         except Exception as e:
-            logger.error(f"发送 Telegram 通知出错: {e}")
+            logger.error(f"[{self.username}] TG 推送失败: {e}")
 
-    def get_csrf_token(self, url=None, html=None):
-        """从页面或 HTML 中提取 CSRF Token"""
-        try:
-            if html is None and url:
-                resp = self.session.get(url, timeout=20)
-                html = resp.text
-            
-            if not html:
-                return None
-                
-            soup = BeautifulSoup(html, 'html.parser')
-            token_meta = soup.find('meta', attrs={'name': 'csrf-token'})
-            if token_meta:
-                self.csrf_token = token_meta.get('content')
-                return self.csrf_token
-            
-            token_input = soup.find('input', attrs={'name': '_token'})
-            if token_input:
-                self.csrf_token = token_input.get('value')
-                return self.csrf_token
-        except Exception as e:
-            logger.error(f"获取 CSRF Token 失败: {e}")
+    def get_csrf_token(self, html):
+        if not html: return ""
+        soup = BeautifulSoup(html, 'html.parser')
+        meta = soup.find('meta', attrs={'name': 'csrf-token'})
+        if meta: self.csrf_token = meta.get('content')
+        else:
+            inp = soup.find('input', attrs={'name': '_token'})
+            if inp: self.csrf_token = inp.get('value')
         return self.csrf_token
 
     def check_login(self):
-        """检查登录状态并获取用户名"""
         try:
             resp = self.session.get(f"{self.base_url}/dashboard", timeout=20, allow_redirects=True)
-            if "/login" in resp.url:
+            if "/login" in resp.url or resp.status_code != 200:
                 return False
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            self.get_csrf_token(resp.text)
+            
+            # 提取邮箱/用户名
+            email_tag = soup.select_one('p.font-light.text-gray-500') or soup.find('p', string=re.compile(r'.+@.+\..+'))
+            if email_tag and "[email" not in email_tag.get_text():
+                self.username = email_tag.get_text().strip()
+            
+            # 提取余额
+            balance_link = soup.select_one('a[href*="/balance"]')
+            if balance_link:
+                balance_tag = balance_link.find(['dt', 'h4', 'div'], class_=re.compile(r'font-extrabold|text-3xl'))
+                if balance_tag: self.balance = balance_tag.get_text().strip()
+            if self.balance == "未知":
+                b_text = soup.find(string=re.compile(r'(¥|€|余额)\s*\d+\.\d+'))
+                if b_text: self.balance = b_text.strip()
                 
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                self.get_csrf_token(html=resp.text)
-                
-                email_tag = soup.select_one('p.font-light.text-gray-500')
-                if not email_tag:
-                    email_tag = soup.find('p', string=re.compile(r'.+@.+\..+'))
-                
-                if email_tag and "[email" not in email_tag.get_text():
-                    self.username = email_tag.get_text().strip()
-                else:
-                    name_tag = soup.select_one('h3 > a[href="#"]')
-                    if name_tag:
-                        self.username = name_tag.get_text().strip()
-                    elif email_tag:
-                        self.username = email_tag.get_text().strip()
-
-                balance_link = soup.select_one('a[href*="/balance"]')
-                if balance_link:
-                    balance_tag = balance_link.find(['dt', 'h4', 'div'], class_=re.compile(r'font-extrabold|text-3xl'))
-                    if balance_tag:
-                        self.balance = balance_tag.get_text().strip()
-                
-                if self.balance == "未知":
-                    balance_text = soup.find(string=re.compile(r'(¥|€|余额)\s*\d+\.\d+'))
-                    if balance_text:
-                        self.balance = balance_text.strip()
-                
-                logger.info(f"✅ 账号 {self.username} 登录成功 (余额: {self.balance})")
-                return True
+            logger.info(f"✅ 账号 [{self.username}] 登录成功 | 余额: {self.balance}")
+            return True
         except Exception as e:
-            logger.error(f"登录状态检查异常: {e}")
-        return False
+            logger.error(f"[{self.username}] 登录检查异常: {e}")
+            return False
 
     def get_service_ids(self):
-        """获取所有服务 ID"""
-        logger.info("正在获取服务列表...")
         try:
             resp = self.session.get(f"{self.base_url}/dashboard", timeout=20)
-            ids = re.findall(r'service/(\d+)/manage', resp.text)
-            return list(set(ids))
-        except Exception as e:
-            logger.error(f"获取服务 ID 失败: {e}")
+            return list(set(re.findall(r'service/(\d+)/manage', resp.text)))
+        except Exception:
             return []
 
     def renew_service(self, service_id):
-        """对指定服务进行续期"""
-        logger.info(f"正在为服务 {service_id} 申请续期...")
         manage_url = f"{self.base_url}/service/{service_id}/manage"
-        
-        resp = self.session.get(manage_url, timeout=20)
-        token = self.get_csrf_token(html=resp.text)
-        if not token:
-            return False, "获取续期 Token 失败"
-
-        renew_url = f"{self.base_url}/service/{service_id}/renew"
-        data = {
-            "_token": token,
-            "days": "7"
-        }
-        xsrf_token = self.session.cookies.get("XSRF-TOKEN")
-        headers = {
-            "Referer": manage_url,
-            "Origin": self.base_url,
-            "X-CSRF-TOKEN": token
-        }
-        if xsrf_token:
-            from urllib.parse import unquote
-            headers["X-XSRF-TOKEN"] = unquote(xsrf_token)
-
         try:
-            resp = self.session.post(renew_url, data=data, headers=headers, timeout=20)
-            if "invoice" in resp.url or "payment" in resp.url:
+            resp = self.session.get(manage_url, timeout=20)
+            token = self.get_csrf_token(resp.text)
+            if not token: return False, "获取 Token 失败"
+
+            renew_url = f"{self.base_url}/service/{service_id}/renew"
+            headers = {"Referer": manage_url, "Origin": self.base_url, "X-CSRF-TOKEN": token}
+            xsrf = self.session.cookies.get("XSRF-TOKEN")
+            if xsrf: headers["X-XSRF-TOKEN"] = unquote(xsrf)
+
+            res = self.session.post(renew_url, data={"_token": token, "days": "7"}, headers=headers, timeout=20)
+            if "invoice" in res.url or "payment" in res.url:
                 return True, "自动续期成功 (7天)"
             
-            soup_res = BeautifulSoup(resp.text, 'html.parser')
-            alert = soup_res.find(['div', 'span'], attrs={'role': 'alert'})
+            soup = BeautifulSoup(res.text, 'html.parser')
+            alert = soup.find(['div', 'span'], attrs={'role': 'alert'})
             if alert:
-                alert_text = alert.get_text(strip=True)
-                if "only renew" in alert_text or "expires in" in alert_text:
-                    days_match = re.search(r'expires in (\d+) days', alert_text)
-                    days_info = f" (剩余 {days_match.group(1)} 天)" if days_match else ""
-                    return True, f"未到续期时间{days_info}"
-                return False, f"申请失败: {alert_text}"
-            
-            if resp.status_code == 200 and "dash.hidencloud.com/service" in resp.url:
-                return True, "状态正常"
-                
-            return False, f"续期请求失败: {resp.status_code}"
+                txt = alert.get_text(strip=True)
+                if "only renew" in txt or "expires in" in txt:
+                    match = re.search(r'expires in (\d+) days', txt)
+                    return True, f"未到期 (剩 {match.group(1)} 天)" if match else "未到续期时间"
+                return False, f"基础错误: {txt}"
+            return True, "状态正常"
         except Exception as e:
             return False, f"续期异常: {e}"
 
     def pay_unpaid_invoices(self, service_id):
-        """检测并支付未支付订单"""
-        logger.info(f"正在检查服务 {service_id} 的待支付订单...")
-        invoice_list_url = f"{self.base_url}/service/{service_id}/invoices?where=unpaid"
+        list_url = f"{self.base_url}/service/{service_id}/invoices?where=unpaid"
         try:
-            resp = self.session.get(invoice_list_url, timeout=20)
+            resp = self.session.get(list_url, timeout=20)
             soup = BeautifulSoup(resp.text, 'html.parser')
-            invoice_links = []
-            
+            links = []
             for a in soup.find_all('a', href=True):
-                href = a['href']
-                if '/invoice/' in href and 'download' not in href:
+                if '/invoice/' in a['href'] and 'download' not in a['href']:
                     parent = a.find_parent(['tr', 'div', 'li'])
-                    if parent:
-                        parent_text = parent.get_text()
-                        if any(kw in parent_text for kw in ['Unpaid', '待支付', '未支付', '待付款', "Invoice"]):
-                            invoice_links.append(href)
+                    if parent and any(k in parent.get_text() for k in ['Unpaid', '待支付', '未支付', '待付款']):
+                        links.append(a['href'])
             
-            if not invoice_links:
-                return True, "暂无未支付订单"
+            links = list(set(links))
+            if not links: return True, "暂无未支付订单"
 
             success_count = 0
-            invoice_links = list(set(invoice_links))
-            
-            for inv_link in invoice_links:
-                if not inv_link.startswith('http'):
-                    inv_link = self.base_url + inv_link
+            for link in links:
+                inv_url = link if link.startswith('http') else self.base_url + link
+                inv_res = self.session.get(inv_url, timeout=20)
+                inv_soup = BeautifulSoup(inv_res.text, 'html.parser')
                 
-                logger.info(f"  └ 正在处理账单页面: {inv_link.split('/')[-1]}")
-                inv_resp = self.session.get(inv_link, timeout=20)
-                inv_soup = BeautifulSoup(inv_resp.text, 'html.parser')
-                
-                pay_form = None
-                for form in inv_soup.find_all('form'):
-                    action = form.get('action', '')
-                    if 'balance/add' in action: continue
-                    
-                    btn = form.find(['button', 'input'], attrs={'type': 'submit'})
-                    if not btn: btn = form.find('button')
-                    
-                    if btn and ('支付' in btn.get_text() or 'Pay' in btn.get_text() or '确认' in btn.get_text()):
-                        pay_form = form
+                form = None
+                for f in inv_soup.find_all('form'):
+                    if 'balance/add' in f.get('action', ''): continue
+                    btn = f.find(['button', 'input'], attrs={'type': 'submit'}) or f.find('button')
+                    if btn and any(k in btn.get_text() for k in ['支付', 'Pay', '确认']):
+                        form = f
                         break
-                
-                if not pay_form:
-                    for form in inv_soup.find_all('form'):
-                        action = form.get('action', '')
-                        if 'invoice' in action or 'payment' in action:
-                            pay_form = form
+                if not form:
+                    for f in inv_soup.find_all('form'):
+                        if 'invoice' in f.get('action', '') or 'payment' in f.get('action', ''):
+                            form = f
                             break
-
-                if pay_form:
-                    action = pay_form.get('action', '')
-                    if not action.startswith('http'):
-                        action = self.base_url + action
-                        
-                    payload = {}
-                    for inp in pay_form.find_all('input'):
-                        name = inp.get('name')
-                        if name:
-                            payload[name] = inp.get('value', '')
-                    
-                    token = self.get_csrf_token(html=inv_resp.text)
+                if form:
+                    act = form.get('action', '')
+                    action_url = act if act.startswith('http') else self.base_url + act
+                    payload = {inp.get('name'): inp.get('value', '') for inp in form.find_all('input') if inp.get('name')}
+                    token = self.get_csrf_token(inv_res.text)
                     if token: payload['_token'] = token
                     
-                    headers = {
-                        "Referer": inv_link,
-                        "X-CSRF-TOKEN": token or self.csrf_token
-                    }
-                    
-                    pay_resp = self.session.post(action, data=payload, headers=headers, timeout=20)
-                    if "成功" in pay_resp.text or "Success" in pay_resp.text or pay_resp.status_code == 200:
+                    headers = {"Referer": inv_url, "X-CSRF-TOKEN": token or self.csrf_token}
+                    pay_res = self.session.post(action_url, data=payload, headers=headers, timeout=20)
+                    if any(k in pay_res.text for k in ["成功", "Success"]) or pay_res.status_code == 200:
                         success_count += 1
-                        logger.info("    ✅ 余额扣费成功")
-                    else:
-                        logger.warning(f"    ❌ 扣费失败 (状态码: {pay_resp.status_code})")
-                else:
-                    logger.warning("    ⚠️ 未能在账单页找到支付按钮")
-
-            return True, f"自动扣费完成 ({success_count}/{len(invoice_links)} 成功)"
+            return True, f"扣费成功 ({success_count}/{len(links)})"
         except Exception as e:
-            return False, f"支付异常: {e}"
+            return False, f"扣费异常: {e}"
 
-    def run_task(self):
-        """运行完整续费任务"""
+    def execute(self):
         if not self.check_login():
-            logger.error("❌ Cookie 已失效或无法访问 Dashboard")
-            self.send_tg_notification("❌ Cookie 已失效或遭遇阻断，请重新提取并更新 GitHub Secrets")
+            logger.error(f"❌ 账号进程 [{self.username}] Cookie 失效或遭 cf 阻断")
+            self.send_tg_notification("❌ **Cookie 已失效或遭遇阻断**，请登录官网重新抓取覆盖。")
             return
 
-        logger.info(f"账号 {self.username} 登录验证通过，开始执行任务...")
-        service_ids = self.get_service_ids()
-        if not service_ids:
-            logger.warning("未找到任何活跃服务")
-            self.send_tg_notification("🧾 扣费检测: `暂无活跃服务`")
+        s_ids = self.get_service_ids()
+        if not s_ids:
+            self.send_tg_notification("🧾 账单状态: `未检索到任何活跃服务`")
             return
 
         results = []
-        success_count = 0
-        fail_count = 0
-        
-        for s_id in service_ids:
-            r_success, r_msg = self.renew_service(s_id)
-            p_success, p_msg = self.pay_unpaid_invoices(s_id)
+        for s_id in s_ids:
+            _, r_msg = self.renew_service(s_id)
+            _, p_msg = self.pay_unpaid_invoices(s_id)
+            results.append(f" 📦 **服务 ID: {s_id}**\n  └ 续期结果: `{escape_markdown(r_msg)}`\n  └ 扣费检测: `{escape_markdown(p_msg)}`")
             
-            status_icon = "✅" if r_success and p_success else "❌"
-            results.append(f"{status_icon} **服务 {s_id}**\n  └ 续期结果: `{r_msg}`\n  └ 扣费检测: `{p_msg}`")
-            
-            if r_success and p_success:
-                success_count += 1
-            else:
-                fail_count += 1
-
-        summary = f"📊 **执行统计**: 成功 `{success_count}` | 失败 `{fail_count}`\n\n"
-        report = summary + "\n".join(results)
-        
-        logger.info(f"任务完成报告:\n{report}")
+        report = "\n".join(results)
         self.send_tg_notification(report)
 
-        # 检查并自动接力更新 Cookie
-        new_cookie_str = self.get_cookie_string()
-        if new_cookie_str != self.cookie_str:
-            logger.info("检测到 Cookie 已自动刷新，准备同步到 GitHub Secrets")
-            self.update_github_secret(new_cookie_str)
-            self.update_local_config(new_cookie_str)
+        # 全自动智能接力
+        new_cookie = self.get_cookie_string()
+        if new_cookie != self.cookie_str and len(self.cookie_str) > 20:
+            self.update_github_secret(new_cookie)
 
-    def update_local_config(self, new_cookie):
-        """同步更新本地 config.json"""
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(current_dir, "config.json")
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r') as f:
-                    config_data = json.load(f)
-                
-                updated = False
-                for acc in config_data.get("accounts", []):
-                    if acc.get("cookie_str") == self.cookie_str or len(config_data.get("accounts", [])) == 1:
-                        acc["cookie_str"] = new_cookie
-                        updated = True
-                        break
-                
-                if updated:
-                    with open(config_path, 'w') as f:
-                        json.dump(config_data, f, indent=4, ensure_ascii=False)
-                    logger.info("✅ 本地 config.json 已同步更新")
-            except Exception as e:
-                logger.error(f"更新本地 config.json 失败: {e}")
+
+def parse_proxy_node(node_url):
+    """【硬核补全】全协议代理节点解析模块，完美输出标准 Xray 客户端配置"""
+    node_url = node_url.strip()
+    config = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks"}],
+        "outbounds": []
+    }
+    try:
+        if node_url.startswith("socks5://") or node_url.startswith("socks://"):
+            return "external", node_url.split("#")[0].replace("socks5://", "").replace("socks://", "")
+
+        elif node_url.startswith("vless://"):
+            # vless://uuid@host:port?query#remarks
+            parsed = urlparse(node_url)
+            uuid = parsed.username
+            host, port = parsed.hostname, parsed.port
+            query = parse_qs(parsed.query)
+            
+            vless_outbound = {
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": host, "port": int(port), "users": [{"id": uuid, "encryption": "none"}]}]},
+                "streamSettings": {"network": query.get("type", ["tcp"])[0]}
+            }
+            if query.get("security", ["none"])[0] == "reality":
+                vless_outbound["streamSettings"].update({
+                    "security": "reality",
+                    "realitySettings": {"serverName": query.get("sni", [""])[0], "publicKey": query.get("pbk", [""])[0], "shortId": query.get("sid", [""])[0]}
+                })
+            config["outbounds"].append(vless_outbound)
+
+        elif node_url.startswith("vmess://"):
+            # vmess://base64(json)
+            b64_str = node_url[8:].split("#")[0]
+            # 补齐 base64 填充
+            b64_str += "=" * (-len(b64_str) % 4)
+            v_data = json.loads(base64.b64decode(b64_str).decode("utf-8"))
+            
+            config["outbounds"].append({
+                "protocol": "vmess",
+                "settings": {"vnext": [{"address": v_data.get("add"), "port": int(v_data.get("port")), "users": [{"id": v_data.get("id"), "alterId": int(v_data.get("aid", 0))}]}]},
+                "streamSettings": {"network": v_data.get("net", "tcp"), "security": "none"}
+            })
+
+        elif node_url.startswith("trojan://"):
+            # trojan://password@host:port?query
+            parsed = urlparse(node_url)
+            password = parsed.username
+            host, port = parsed.hostname, parsed.port
+            config["outbounds"].append({
+                "protocol": "trojan",
+                "settings": {"servers": [{"address": host, "port": int(port), "password": password}]},
+                "streamSettings": {"security": "tls"}
+            })
+
+        elif node_url.startswith("ss://"):
+            # ss://base64(method:password)@host:port
+            parsed = urlparse(node_url)
+            host, port = parsed.hostname, parsed.port
+            user_info = parsed.username
+            user_info += "=" * (-len(user_info) % 4)
+            method, password = base64.b64decode(user_info).decode("utf-8").split(":", 1)
+            
+            config["outbounds"].append({
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{"address": host, "port": int(port), "method": method, "password": password}]}
+            })
+        else:
+            return None, None
+            
+        with open("xray_config.json", "w") as f:
+            json.dump(config, f, indent=4)
+        return "xray", "127.0.0.1:1080"
+    except Exception as e:
+        logger.error(f"解析代理节点发生致命错误: {e}")
+        return None, None
+
 
 def main():
-    # 1. 优先从环境变量 HIDEN_COOKIE 读取
-    env_cookies = os.environ.get("HIDEN_COOKIE")
-    proxy_server = os.environ.get("PROXY_SERVER", "").strip()
+    env_cookies = os.environ.get("HIDEN_COOKIE", "").strip()
+    proxy_node = os.environ.get("PROXY_NODE", "").strip()
     
-    config = {}
-    account_cookies = []
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(current_dir, "config.json")
-    
-    if env_cookies:
-        logger.info("从环境变量 HIDEN_COOKIE 加载账号信息")
-        # 支持 & 或 换行符 分隔多账号
-        account_cookies = [c.strip() for c in re.split(r'[&\n]', env_cookies) if c.strip()]
-    elif os.path.exists(config_path):
-        logger.info("从本地 config.json 加载账号信息")
-        try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-                accounts = config.get("accounts", [])
-                for acc in accounts:
-                    if acc.get("cookie_str"):
-                        account_cookies.append(acc.get("cookie_str"))
-                    elif acc.get("cookies"):
-                        if isinstance(acc["cookies"], dict):
-                            c_str = "; ".join([f"{k}={v}" for k, v in acc["cookies"].items()])
-                        else:
-                            c_str = str(acc["cookies"])
-                        account_cookies.append(c_str)
-        except Exception as e:
-            logger.error(f"读取 config.json 失败: {e}")
-            return
-    else:
-        logger.error("未找到 HIDEN_COOKIE 环境变量或 config.json")
+    if not env_cookies:
+        logger.error("未找到环境变量 HIDEN_COOKIE，终止进程。")
         return
 
-    # 2. 组装代理字典
-    proxy_dict = {}
-    if proxy_server:
-        proxy_dict = {
-            "http": f"socks5://{proxy_server}",
-            "https://f socks5://{proxy_server}".replace("https://f socks5://", "socks5://") # 安全纠错，保障格式正确
-        }
-        logger.info(f"代理就绪，已挂载局域网分流节点: {proxy_server}")
+    # 智能多账号流切分
+    accounts = [c.strip() for c in re.split(r'[&\n]', env_cookies) if c.strip()]
+    logger.info(f"成功载入 {len(accounts)} 个目标账号。")
 
-    # 3. 组装 TG 配置
+    # 动态组装全局分流代理
+    proxy_dict = None
+    if proxy_node:
+        mode, server = parse_proxy_node(proxy_node)
+        if mode == "external":
+            proxy_dict = {"http": f"socks5://{server}", "https": f"socks5://{server}"}
+            logger.info(f"已采用外部直连 SOCKS5 代理: {server}")
+        elif mode == "xray":
+            import subprocess
+            logger.info("正在启动后台本地分布式 Xray 核心引擎...")
+            subprocess.Popen(["./xray/xray", "run", "-c", "xray_config.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(3) # 给予稳健的握手建连时间
+            proxy_dict = {"http": f"socks5://{server}", "https": f"socks5://{server}"}
+            logger.info("本地 Xray 轻量代理桥接网络已搭建成功。")
+
     tg_config = {
-        "bot_token": os.environ.get("TG_BOT_TOKEN") or config.get("telegram", {}).get("bot_token"),
-        "chat_id": os.environ.get("TG_CHAT_ID") or config.get("telegram", {}).get("chat_id")
+        "bot_token": os.environ.get("TG_BOT_TOKEN"),
+        "chat_id": os.environ.get("TG_CHAT_ID")
     }
 
-    # 4. 流水线并发执行
-    for idx, cookie_str in enumerate(account_cookies, 1):
-        if not cookie_str.strip(): continue
-        try:
-            logger.info(f"🚀 [账号进程 {idx}/{len(account_cookies)}] 准备就绪")
-            bot = HidenCloud(cookie_str, tg_config, proxy_dict)
-            bot.run_task()
-        except Exception as e:
-            logger.error(f"处理第 {idx} 个账号时发生致命异常: {e}")
+    # 【高能保留】README 承诺的多账号高并发调度
+    max_workers = min(5, len(accounts))
+    logger.info(f"开启多线程高并发流水线，最大并发数: {max_workers}")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for idx, cookie in enumerate(accounts, 1):
+            bot = HidenCloudBot(cookie, tg_config, proxy_dict, account_idx=idx)
+            futures.append(executor.submit(bot.execute))
+        
+        # 等待所有线程执行完毕
+        for future in futures:
+            future.result()
 
 if __name__ == "__main__":
     main()
