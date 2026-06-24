@@ -34,7 +34,7 @@ jobs:
         run: |
           pip install curl_cffi requests beautifulsoup4 pynacl
 
-      - name: 安装并启动代理
+            - name: 安装并启动代理
         env:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
         run: |
@@ -43,6 +43,115 @@ jobs:
             exit 0
           fi
 
+          # ── 判断协议类型 ──
+          NODE=$(echo "$PROXY_NODE" | tr '[:upper:]' '[:lower:]')
+          if echo "$NODE" | grep -q '^hy2://\|^hysteria2://'; then
+            PROTOCOL="hy2"
+          elif echo "$NODE" | grep -q '^vless://'; then
+            PROTOCOL="vless"
+          elif echo "$NODE" | grep -q '^vmess://'; then
+            PROTOCOL="vmess"
+          elif echo "$NODE" | grep -q '^trojan://'; then
+            PROTOCOL="trojan"
+          elif echo "$NODE" | grep -q '^ss://'; then
+            PROTOCOL="ss"
+          elif echo "$NODE" | grep -q '^socks5://\|^socks://'; then
+            PROTOCOL="socks5"
+          else
+            echo "[ERROR] 不支持的协议: $(echo "$PROXY_NODE" | cut -d: -f1)"
+            exit 1
+          fi
+
+          echo "[INFO] 检测到协议: $PROTOCOL"
+
+          # ── socks5 直接用，不需要本地代理 ──
+          if [ "$PROTOCOL" = "socks5" ]; then
+            echo "PROXY_SERVER=$PROXY_NODE" >> $GITHUB_ENV
+            echo "[INFO] ✅ 使用外部 SOCKS5 代理"
+            exit 0
+          fi
+
+          # ── hy2: 下载 Hysteria 官方核心 ──
+          if [ "$PROTOCOL" = "hy2" ]; then
+            wget -q https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -O hysteria
+            chmod +x hysteria
+
+            python3 << 'PYEOF'
+            import os, sys, json, base64
+            from urllib.parse import parse_qs, unquote, urlparse
+
+            def mask(s):
+                return f"{s[:2]}***{s[-2:]}" if len(s) > 4 else "****"
+
+            url = os.environ.get("PROXY_NODE", "").strip()
+            # hy2://password@host:port?...#remark 或 hysteria2://...
+            if url.startswith("hysteria2://"):
+                content = url[len("hysteria2://"):]
+            else:
+                content = url[len("hy2://"):]
+
+            if "#" in content:
+                content = content.rsplit("#", 1)[0]
+
+            password, rest = content.split("@", 1)
+            if "?" in rest:
+                host_port, params_str = rest.split("?", 1)
+            else:
+                host_port, params_str = rest, ""
+            address, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
+            params = parse_qs(params_str)
+            sni = params.get("sni", [address])[0]
+            insecure = params.get("insecure", ["0"])[0] == "1"
+            obfs = params.get("obfs", [""])[0]
+            obfs_password = params.get("obfs-password", [""])[0]
+
+            print(f"[INFO] Hysteria2 -> {mask(address)}:{port} (sni: {sni})")
+
+            config = {
+                "server": f"{address}:{port}",
+                "auth": password,
+                "tls": {
+                    "sni": sni,
+                    "insecure": insecure
+                },
+                "socks5": {
+                    "listen": "127.0.0.1:1080"
+                },
+                "http": {
+                    "listen": "127.0.0.1:1081"
+                }
+            }
+            if obfs:
+                config["obfs"] = {
+                    "type": obfs,
+                    "password": obfs_password
+                }
+
+            with open("hy2_config.json", "w") as f:
+                json.dump(config, f, indent=2)
+            print("[INFO] ✅ Hysteria2 代理配置已生成")
+            PYEOF
+
+            ./hysteria -c hy2_config.json > hy2.log 2>&1 &
+            sleep 3
+
+            echo "[INFO] 测试代理连接..."
+            for i in 1 2 3 4 5; do
+              if curl -x socks5://127.0.0.1:1080 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
+                echo "[INFO] ✅ Hysteria2 代理连接成功"
+                echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+                exit 0
+              fi
+              echo "[WARN] 尝试 $i/5..."
+              sleep 3
+            done
+
+            echo "[ERROR] ❌ Hysteria2 代理连接失败"
+            cat hy2.log
+            exit 1
+          fi
+
+          # ── vless/vmess/trojan/ss: 下载 Xray 官方核心 ──
           wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -q Xray-linux-64.zip -d xray && chmod +x xray/xray
 
@@ -54,10 +163,6 @@ jobs:
               return f"{s[:2]}***{s[-2:]}" if len(s) > 4 else "****"
 
           url = os.environ.get("PROXY_NODE", "").strip()
-          if not url:
-              print("[ERROR] PROXY_NODE 为空")
-              sys.exit(1)
-
           if url.startswith("vless://"):
               protocol = "vless"
               content = url[8:]
@@ -70,19 +175,8 @@ jobs:
           elif url.startswith("ss://"):
               protocol = "ss"
               content = url[5:]
-          elif url.startswith("socks5://") or url.startswith("socks://"):
-              protocol = "socks5"
-              content = url.split("://")[1].split("#")[0]
-              if "@" in content:
-                  server = content.split("@")[1].split(":")[0]
-              else:
-                  server = content.split(":")[0]
-              print(f"[INFO] SOCKS5 -> {mask(server)}")
-              with open("use_external_socks.txt", "w") as f:
-                  f.write(url.split("#")[0])
-              sys.exit(0)
           else:
-              print(f"[ERROR] 不支持的协议: {url.split('://')[0]}")
+              print(f"[ERROR] 不支持的协议")
               sys.exit(1)
 
           if "#" in content:
@@ -111,6 +205,7 @@ jobs:
               fp = params.get("fp", ["chrome"])[0]
               flow = params.get("flow", [""])[0]
               pbk = params.get("pbk", [""])[0]
+              sid = params.get("sid", [""])[0]
               host = params.get("host", [sni])[0]
               path = unquote(params.get("path", ["/"])[0])
 
@@ -126,7 +221,7 @@ jobs:
                   outbound["settings"]["vnext"][0]["users"][0]["flow"] = flow
               if security == "reality":
                   outbound["streamSettings"]["realitySettings"] = {
-                      "serverName": sni, "fingerprint": fp, "publicKey": pbk}
+                      "serverName": sni, "fingerprint": fp, "publicKey": pbk, "shortId": sid}
               elif security == "tls":
                   outbound["streamSettings"]["tlsSettings"] = {
                       "serverName": sni, "fingerprint": fp, "allowInsecure": False}
@@ -170,6 +265,8 @@ jobs:
                       "serverName": sni, "fingerprint": fp, "allowInsecure": False}
               if network == "ws":
                   outbound["streamSettings"]["wsSettings"] = {"path": path, "headers": {"Host": host}}
+              elif network == "grpc":
+                  outbound["streamSettings"]["grpcSettings"] = {"serviceName": vm.get("path", "")}
               config["outbounds"].append(outbound)
 
           elif protocol == "trojan":
@@ -228,13 +325,6 @@ jobs:
           print("[INFO] ✅ 代理配置已生成")
           PYEOF
 
-          if [ -f "use_external_socks.txt" ]; then
-            EXTERNAL_SOCKS=$(cat use_external_socks.txt)
-            echo "PROXY_SERVER=$EXTERNAL_SOCKS" >> $GITHUB_ENV
-            echo "[INFO] ✅ 使用外部 SOCKS5 代理"
-            exit 0
-          fi
-
           ./xray/xray run -c xray_config.json > xray.log 2>&1 &
           sleep 5
 
@@ -252,7 +342,6 @@ jobs:
           echo "[ERROR] ❌ 代理连接失败"
           cat xray.log
           exit 1
-
       - name: Run HidenCloud Renew Script
         env:
           HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
