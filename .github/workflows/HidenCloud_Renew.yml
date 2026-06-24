@@ -5,8 +5,10 @@ on:
     - cron: '0 4 * * *'
   workflow_dispatch:
 
+# 必须显式声明写权限，以便能够删除旧的工作流历史记录
 permissions:
   contents: read
+  actions: write
 
 jobs:
   renew:
@@ -92,3 +94,14 @@ jobs:
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: |
           python hidencloud_renew.py
+
+      # =======================================================
+      # 新增核心步骤：自动清理历史记录，只保留最新 5 次运行记录
+      # =======================================================
+      - name: Delete Old Workflow Runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0              # 不按天数保留，完全按个数控制
+          keep_minimum_runs: 5        # 严格保留最近的 5 次记录（可自行改为 3）
