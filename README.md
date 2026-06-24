@@ -7,16 +7,18 @@
   <img src="https://img.shields.io/github/license/SunshineList/hidencloud_renew?style=flat-square" alt="GitHub license">
 </p>
 
-HidenCloud 自动续费脚本，支持多账号并发、Telegram 通知及 Cookie 自动更新持久化。
+HidenCloud 自动续费脚本，基于 `curl_cffi` 完美绕过 Cloudflare 安全防护。支持多账号并发执行、未支付账单自动扣费、Telegram 综合报告推送以及自动清理历史运行记录。
 
 针对部分网络环境受限、无法正常访问目标网站的问题，本项目**内置了全协议代理分流网络功能**。脚本在运行时会自动下载 Xray 核心并搭建本地轻量代理，无需额外安装任何 Actions 插件。
 
 ## 💡 核心功能
 
-- **自动续期**：默认自动续期 7 天。
-- **自动扣费**：智能检测账户下未支付的订单，并自动使用账户余额完成支付。
-- **TG 推送**：集成 Telegram Bot 消息推送，通知内容包含：账号信息、账户余额、执行结果及每日一言。
-- **自动持久化**：配合 GitHub PAT（个人访问令牌），脚本可自动回写更新后的 Cookie 到 Repository Secrets 中，免去频繁手动更新的烦恼。
+- **多账号并发**：支持在配置中同时注入多个账号的 Cookie，流水线式依次触发，高效稳定。
+- **免密托管（过 CF 盾）**：采用轻量级 `curl_cffi` 模拟真实浏览器指纹，免去臃肿的无头浏览器，完美绕过人机验证。
+- **自动续期**：自动请求官网续期接口（默认自动续期 7 天）。
+- **智能自动扣费**：智能检测账户下所有处于 `unpaid`（未支付）状态的订单，并自动使用账户可用余额完成支付。
+- **TG 推送+每日一言**：集成 Telegram Bot 消息推送，通知内容包含：账号脱敏标识、账户余额、续期结果、账单扣款状态及动态注入的每日一言。
+- **历史记录自动清理**：工作流每次运行完毕后，会自动触发清理机制，**严格只保留最近 5 次的运行历史记录**，防止产生海量日志。
 - **内置原生代理**：集成 Xray 核心，完美支持 `Vless` / `Vmess` / `Trojan` / `Shadowsocks` / `Socks5` 等主流节点链接的自动解析与本地分流环境搭建。
 
 ---
@@ -37,7 +39,7 @@ HidenCloud 自动续费脚本，支持多账号并发、Telegram 通知及 Cooki
 | **`HIDEN_COOKIE`** | ✅ 必填 | 步骤 1 中复制的 Cookie。如需运行多账号，账号之间使用 `&` 或 **换行符** 隔开。 |
 | **`TG_BOT_TOKEN`** | ❌ 选填 | 联系 [@BotFather](https://t.me/BotFather) 创建机器人获取的 Token。 |
 | **`TG_CHAT_ID`** | ❌ 选填 | 给 [@userinfobot](https://t.me/userinfobot) 发送消息获取的个人或频道 ID。 |
-| **`GH_PAT`** | ❌ 选填 | 个人访问令牌，[在此生成](https://github.com/settings/tokens)（须勾选 `repo` 权限）。用于实现 Cookie 自动回写更新。 |
+| **`GH_PAT`** | ❌ 选填 | 个人访问令牌，[在此生成](https://github.com/settings/tokens)。**必须勾选 `repo` 和 `workflow` 权限**。用于工作流高权限操作或更高级的清理动作。 |
 | **`PROXY_NODE`** | ❌ 选填 | 网络代理节点链接，用于在受限网络环境下提供网络代理分流。 |
 
 #### 🔗 支持的代理节点格式
@@ -59,7 +61,7 @@ HidenCloud 自动续费脚本，支持多账号并发、Telegram 通知及 Cooki
 
 1. **安装依赖库**：
    ```bash
-   pip install curl_cffi beautifulsoup4 pynacl
+   pip install curl_cffi requests beautifulsoup4 pynacl
 
    ```
 
