@@ -138,33 +138,32 @@ class HidenCloudBot:
             if inp: self.csrf_token = inp.get('value')
         return self.csrf_token
 
-    def check_login(self):
+def check_login_api(self):
+        """优化版：API 结合 HTML 混合嗅探，确保完美提取真实邮箱账号"""
         try:
-            resp = self.session.get(f"{self.base_url}/dashboard", timeout=20, allow_redirects=True)
-            if "/login" in resp.url or resp.status_code != 200:
-                return False
-            
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            self.get_csrf_token(resp.text)
-            
-            # 提取邮箱/用户名
-            email_tag = soup.select_one('p.font-light.text-gray-500') or soup.find('p', string=re.compile(r'.+@.+\..+'))
-            if email_tag and "[email" not in email_tag.get_text():
-                self.username = email_tag.get_text().strip()
-            
-            # 提取余额
-            balance_link = soup.select_one('a[href*="/balance"]')
-            if balance_link:
-                balance_tag = balance_link.find(['dt', 'h4', 'div'], class_=re.compile(r'font-extrabold|text-3xl'))
-                if balance_tag: self.balance = balance_tag.get_text().strip()
-            if self.balance == "未知":
-                b_text = soup.find(string=re.compile(r'(¥|€|余额)\s*\d+\.\d+'))
-                if b_text: self.balance = b_text.strip()
-                
-            logger.info(f"✅ 账号 [{self.username}] 登录成功 | 余额: {self.balance}")
-            return True
+            resp = self.session.get(f"{self.base_url}/api/user", timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "success" or "email" in data:
+                    self.username = data.get("email") or data.get("name") or self.username
+                    self.balance = str(data.get("balance", "未知"))
+                    
+                    # 💡 【核心优化点】如果 API 返回的是默认的 Account_1 或空值，自动回退到 HTML 嗅探
+                    if "Account_" in str(self.username) or not self.username:
+                        logger.info(f"[{self.username}] API未返回真实邮箱，正在尝试从控制台 HTML 提取...")
+                        dash_resp = self.session.get(f"{self.base_url}/dashboard", timeout=20)
+                        if dash_resp.status_code == 200:
+                            soup = BeautifulSoup(dash_resp.text, 'html.parser')
+                            # 使用经典项目的正则和选择器精准捕获邮箱
+                            email_tag = soup.select_one('p.font-light.text-gray-500') or soup.find('p', string=re.compile(r'.+@.+\..+'))
+                            if email_tag and "[email" not in email_tag.get_text():
+                                self.username = email_tag.get_text().strip()
+
+                    logger.info(f"✅ 账号 [{self.username}] 登录成功 | 余额: {self.balance}")
+                    return True
+            return False
         except Exception as e:
-            logger.error(f"[{self.username}] 登录检查异常: {e}")
+            logger.error(f"[{self.username}] API 登录检查异常: {e}")
             return False
 
     def get_service_ids(self):
