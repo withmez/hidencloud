@@ -4,7 +4,6 @@ import os
 import re
 import time
 import base64
-import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from curl_cffi import requests
@@ -18,274 +17,6 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Xray Proxy
-# ---------------------------------------------------------------------------
-
-class XrayProxy:
-    def __init__(self, proxy_node: str):
-        self.proxy_node = proxy_node
-        self.process = None
-        self.socks_port = 10809
-        self.http_port = 10810
-
-    def _parse_node(self, raw: str):
-        raw = raw.strip()
-        if raw.startswith("vless://"):
-            return self._parse_vless(raw)
-        if raw.startswith("vmess://"):
-            return self._parse_vmess(raw)
-        if raw.startswith("trojan://"):
-            return self._parse_trojan(raw)
-        if raw.startswith("ss://"):
-            return self._parse_ss(raw)
-        if raw.startswith(("socks5://", "socks://")):
-            return self._parse_socks(raw)
-        return None
-
-    def _parse_vless(self, link):
-        try:
-            s = link[len("vless://"):]
-            if "#" in s:
-                s, _ = s.rsplit("#", 1)
-            params = {}
-            if "?" in s:
-                s, q = s.split("?", 1)
-                for pair in q.split("&"):
-                    if "=" in pair:
-                        k, v = pair.split("=", 1)
-                        params[k] = v
-            uuid, hp = s.split("@", 1)
-            host, port = hp.rsplit(":", 1)
-            port = int(port)
-            net = params.get("type", "tcp")
-            stream = {"network": net}
-            if net == "ws":
-                stream["wsSettings"] = {
-                    "path": params.get("path", "/"),
-                    "headers": {"Host": params.get("host", host)}
-                }
-            elif net == "grpc":
-                stream["grpcSettings"] = {"serviceName": params.get("serviceName", "")}
-            security = params.get("security", "none")
-            if security != "none":
-                stream["security"] = security
-                tls = {"serverName": params.get("sni", host), "allowInsecure": False}
-                if params.get("fp"):
-                    tls["fingerprint"] = params["fp"]
-                if security == "reality":
-                    tls = {
-                        "serverName": params.get("sni", host),
-                        "publicKey": params.get("pbk", ""),
-                        "shortId": params.get("sid", ""),
-                        "fingerprint": params.get("fp", "chrome"),
-                    }
-                stream[security + "Settings"] = tls
-            return {
-                "protocol": "vless",
-                "settings": {"vnext": [{
-                    "address": host, "port": port,
-                    "users": [{"id": uuid, "encryption": "none",
-                               "flow": params.get("flow") or None}]
-                }]},
-                "streamSettings": stream
-            }
-        except Exception as e:
-            logger.error(f"VLESS 解析失败: {e}")
-            return None
-
-    def _parse_vmess(self, link):
-        try:
-            encoded = link[len("vmess://"):]
-            pad = len(encoded) % 4
-            if pad:
-                encoded += "=" * (4 - pad)
-            c = json.loads(base64.b64decode(encoded))
-            outbound = {
-                "protocol": "vmess",
-                "settings": {"vnext": [{
-                    "address": c.get("add", ""),
-                    "port": int(c.get("port", 443)),
-                    "users": [{"id": c.get("id", ""),
-                               "alterId": int(c.get("aid", 0)),
-                               "security": c.get("scy", "auto")}]
-                }]},
-                "streamSettings": {"network": c.get("net", "tcp")}
-            }
-            if c.get("tls") == "tls":
-                outbound["streamSettings"]["security"] = "tls"
-                outbound["streamSettings"]["tlsSettings"] = {
-                    "serverName": c.get("sni", c.get("add", "")),
-                    "allowInsecure": False
-                }
-            net = c.get("net", "tcp")
-            if net == "ws":
-                outbound["streamSettings"]["wsSettings"] = {
-                    "path": c.get("path", "/"),
-                    "headers": {"Host": c.get("host", c.get("add", ""))}
-                }
-            elif net == "grpc":
-                outbound["streamSettings"]["grpcSettings"] = {"serviceName": c.get("path", "")}
-            return outbound
-        except Exception as e:
-            logger.error(f"VMess 解析失败: {e}")
-            return None
-
-    def _parse_trojan(self, link):
-        try:
-            s = link[len("trojan://"):]
-            if "#" in s:
-                s, _ = s.rsplit("#", 1)
-            params = {}
-            if "?" in s:
-                s, q = s.split("?", 1)
-                for pair in q.split("&"):
-                    if "=" in pair:
-                        k, v = pair.split("=", 1)
-                        params[k] = v
-            password, hp = s.split("@", 1)
-            host, port = hp.rsplit(":", 1)
-            return {
-                "protocol": "trojan",
-                "settings": {"servers": [{
-                    "address": host, "port": int(port), "password": password
-                }]},
-                "streamSettings": {
-                    "network": params.get("type", "tcp"),
-                    "security": "tls",
-                    "tlsSettings": {"serverName": params.get("sni", host), "allowInsecure": False}
-                }
-            }
-        except Exception as e:
-            logger.error(f"Trojan 解析失败: {e}")
-            return None
-
-    def _parse_ss(self, link):
-        try:
-            s = link[len("ss://"):]
-            if "#" in s:
-                s, _ = s.rsplit("#", 1)
-            if "@" in s:
-                mp, hp = s.split("@", 1)
-                pad = len(mp) % 4
-                if pad:
-                    mp += "=" * (4 - pad)
-                decoded = base64.b64decode(mp).decode()
-                method, password = decoded.split(":", 1)
-            else:
-                pad = len(s) % 4
-                if pad:
-                    s += "=" * (4 - pad)
-                decoded = base64.b64decode(s).decode()
-                method, rest = decoded.split(":", 1)
-                if "@" in rest:
-                    password, hp = rest.split("@", 1)
-                else:
-                    hp, password = rest, ""
-            host, port = hp.rsplit(":", 1)
-            return {
-                "protocol": "shadowsocks",
-                "settings": {"servers": [{
-                    "address": host, "port": int(port),
-                    "method": method, "password": password
-                }]}
-            }
-        except Exception as e:
-            logger.error(f"SS 解析失败: {e}")
-            return None
-
-    def _parse_socks(self, link):
-        try:
-            s = link.split("://", 1)[1]
-            if "#" in s:
-                s, _ = s.rsplit("#", 1)
-            auth = ""
-            if "@" in s:
-                auth, s = s.rsplit("@", 1)
-            host, port = s.rsplit(":", 1)
-            cfg = {"address": host, "port": int(port)}
-            if auth and ":" in auth:
-                u, p = auth.split(":", 1)
-                cfg["users"] = [{"user": u, "pass": p}]
-            return {"protocol": "socks", "settings": {"servers": [cfg]}}
-        except Exception as e:
-            logger.error(f"SOCKS 解析失败: {e}")
-            return None
-
-    def start(self):
-        outbound = self._parse_node(self.proxy_node)
-        if not outbound:
-            logger.warning("代理节点解析失败，跳过 Xray")
-            return False
-        xray_dir = os.path.join(os.getcwd(), "xray")
-        xray_bin = os.path.join(xray_dir, "xray")
-        if not os.path.exists(xray_bin):
-            logger.info("正在下载 Xray 核心...")
-            os.makedirs(xray_dir, exist_ok=True)
-            zip_path = os.path.join(os.getcwd(), "xray.zip")
-            subprocess.run(
-                ["curl", "-L", "-s", "-o", zip_path,
-                 "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"],
-                capture_output=True, timeout=120
-            )
-            subprocess.run(["unzip", "-q", "-o", zip_path, "-d", xray_dir],
-                           capture_output=True, timeout=30)
-            subprocess.run(["chmod", "+x", xray_bin], capture_output=True)
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-        config = {
-            "inbounds": [
-                {"tag": "socks-in", "port": self.socks_port, "listen": "127.0.0.1",
-                 "protocol": "socks", "settings": {"auth": "noauth", "udp": False}},
-                {"tag": "http-in", "port": self.http_port, "listen": "127.0.0.1",
-                 "protocol": "http", "settings": {}}
-            ],
-            "outbounds": [outbound]
-        }
-        cfg_path = os.path.join(os.getcwd(), "xray_config.json")
-        with open(cfg_path, "w") as f:
-            json.dump(config, f, indent=2)
-        self.process = subprocess.Popen(
-            [xray_bin, "run", "-c", cfg_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        time.sleep(3)
-        logger.info("正在测试代理连通性...")
-        ok = False
-        for _ in range(5):
-            try:
-                r = requests.get("https://api.ipify.org",
-                                 proxies={"https": f"socks5://127.0.0.1:{self.socks_port}"},
-                                 timeout=10)
-                if r.status_code == 200:
-                    ok = True
-                    break
-            except Exception:
-                time.sleep(2)
-        if ok:
-            logger.info(f"代理已就绪 (SOCKS5 :{self.socks_port} / HTTP :{self.http_port})")
-            return True
-        logger.error("代理连通性测试失败")
-        self.stop()
-        return False
-
-    def get_proxies(self):
-        return {
-            "http": f"http://127.0.0.1:{self.http_port}",
-            "https": f"socks5://127.0.0.1:{self.socks_port}"
-        }
-
-    def stop(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            self.process.wait(timeout=5)
-            logger.info("Xray 已停止")
-
-
-# ---------------------------------------------------------------------------
-# HidenCloud Renew
-# ---------------------------------------------------------------------------
 
 class HidenCloud:
     BASE_URL = "https://dash.hidencloud.com"
@@ -717,19 +448,14 @@ def main():
         "chat_id": os.environ.get("TG_CHAT_ID") or config.get("telegram", {}).get("chat_id")
     }
 
-    # Xray proxy
-    proxy_node = os.environ.get("PROXY_NODE") or config.get("proxy_node", "")
-    xray, proxies = None, None
-    if proxy_node and not proxy_node.startswith("socks"):
-        xray = XrayProxy(proxy_node)
-        if xray.start():
-            proxies = xray.get_proxies()
-        else:
-            xray = None
-    elif proxy_node:
-        proxies = {"http": proxy_node, "https": proxy_node}
+    # 代理：由 YML 中的 "安装并启动代理" step 写入 PROXY_SERVER 环境变量
+    proxy_server = os.environ.get("PROXY_SERVER", "")
+    proxies = None
+    if proxy_server:
+        logger.info(f"检测到代理: {proxy_server}")
+        proxies = {"http": proxy_server, "https": proxy_server}
 
-    # Concurrent execution
+    # 并发执行
     with ThreadPoolExecutor(max_workers=min(len(config_cookies), 5)) as pool:
         futs = {}
         for cs in config_cookies:
@@ -743,9 +469,6 @@ def main():
                 f.result()
             except Exception as e:
                 logger.error(f"账号 {futs[f]} 异常: {e}")
-
-    if xray:
-        xray.stop()
 
 
 if __name__ == "__main__":
