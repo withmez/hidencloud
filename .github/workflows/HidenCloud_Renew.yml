@@ -1,26 +1,25 @@
-name: HidenCloud 终极自动续费
+name: HidenCloud 自动续期
 
 on:
   schedule:
     - cron: '0 4 * * *'
   workflow_dispatch:
 
-# 限制同名工作流交叉排队运行，避免多线程冲突与回写覆盖
 concurrency:
   group: hidencloud-renew
-  cancel-in-progress: false
+  cancel-in-progress: false  # 设为 false，确保前后任务顺序排队，防止回写 Secret 时冲突覆盖
 
 permissions:
   contents: read
-  actions: write
+  actions: write             # 必须显式声明 Actions 写权限，用于删除旧的历史记录
 
 env:
-  PYTHONUNBUFFERED: "1"  # 实时输出 Python 原生日志，绝不积压缓存
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # 扩展时长，防多账号并发和网络延迟卡死
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Code
@@ -31,39 +30,39 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Project Dependencies
+      - name: Install Dependencies
         run: |
           pip install curl_cffi requests beautifulsoup4 pynacl
 
-      - name: Setup Embedded Xray Engine
+      - name: Setup Xray Proxy Node
         env:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
         run: |
           if [ -z "$PROXY_NODE" ] || [[ "$PROXY_NODE" == socks* ]]; then
-            echo "[INFO] 未检测到需要本地 Xray 核心转译的节点链接，跳过核心下载。"
+            echo "[INFO] 未检测到复杂协议链接，跳过 Xray 核心下载。"
             exit 0
           fi
-          echo "[INFO] 正在拉取最新的官方原生 Xray 核心安全组件..."
+          echo "[INFO] 正在下载分布式 Xray 核心安全组件..."
           mkdir -p xray
           curl -L -s https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
           unzip -q xray.zip -d xray
           chmod +x ./xray/xray
-          echo "[INFO] 核心引擎下载完毕。"
 
-      - name: Execute Parallel Tasks
+      - name: Run HidenCloud Renew Script
         env:
           HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GH_PAT: ${{ secrets.GH_PAT }}
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python b.py
+          python hidencloud_renew.py  # 👈 这里已修正为对应你项目实际的脚本名称
 
       # =======================================================
-      # 高能保留：工作流运行完毕，强制清理，使历史严格保持 5 个以内
+      # 继承并落实：自动清理历史记录，使历史严格保持在 5 个以内
       # =======================================================
-      - name: Auto Clean Actions History
+      - name: Delete Old Workflow Runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
