@@ -7,11 +7,11 @@ on:
 
 concurrency:
   group: hidencloud-renew
-  cancel-in-progress: false  # 设为 false，确保前后任务顺序排队，防止回写 Secret 时冲突覆盖
+  cancel-in-progress: false
 
 permissions:
   contents: read
-  actions: write             # 必须显式声明 Actions 写权限，用于删除旧的历史记录
+  actions: write
 
 env:
   PYTHONUNBUFFERED: "1"
@@ -42,7 +42,7 @@ jobs:
             echo "[INFO] 未检测到复杂协议链接，跳过 Xray 核心下载。"
             exit 0
           fi
-          echo "[INFO] 正在下载分布式 Xray 核心安全组件..."
+          echo "[INFO] 正在下载 Xray 核心..."
           mkdir -p xray
           curl -L -s https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
           unzip -q xray.zip -d xray
@@ -57,11 +57,8 @@ jobs:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python hidencloud_renew.py  # 👈 这里已修正为对应你项目实际的脚本名称
+          python hidencloud_renew.py
 
-      # =======================================================
-      # 继承并落实：自动清理历史记录，使历史严格保持在 5 个以内
-      # =======================================================
       - name: Delete Old Workflow Runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
