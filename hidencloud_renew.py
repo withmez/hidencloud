@@ -59,7 +59,6 @@ def process_renew(cookie, proxy_dict):
         log_content += f"💰 账户余额: `{balance}` 元\n"
 
         # 2. 执行续期操作 (调用续期 API，默认续期 7 天)
-        # 注意：这里根据 HidenCloud 的标准 Vhost/VPS 续期请求抓包重构
         renew_res = session.post("https://dash.hidencloud.com/api/vps/renew", headers=headers, impersonate="chrome120", timeout=15)
         renew_data = renew_res.json()
         
@@ -104,10 +103,13 @@ def main():
     cookie_list = [c.strip() for c in re.split(r'[&\n]', raw_cookies) if c.strip()]
     print(f"[INFO] 成功载入 {len(cookie_list)} 个账号")
 
-    # 配置代理
+    # 配置代理 (修复了语法错误)
     proxy_dict = {}
     if proxy_server:
-        proxy_dict = {"http": f"socks5://{proxy_server}", "https://f socks5://{proxy_server}"}
+        proxy_dict = {
+            "http": f"socks5://{proxy_server}",
+            "https": f"socks5://{proxy_server}"
+        }
 
     final_report = "📢 **HidenCloud 自动续费运行报告**\n\n"
     for idx, cookie in enumerate(cookie_list, 1):
