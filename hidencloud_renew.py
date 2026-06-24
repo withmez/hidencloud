@@ -1,94 +1,124 @@
-name: HidenCloud 自动续期
+import os
+import sys
+import re
+import time
+import requests
+from curl_cffi import requests as json_requests
 
-on:
-  schedule:
-    - cron: '0 4 * * *'
-  workflow_dispatch:
+# 格式化账号显示
+def mask_cookie(cookie_str):
+    match = re.search(r'hidencloud_session=([^;]+)', cookie_str)
+    if match:
+        return f"Account_Session({match.group(1)[:8]}***)"
+    return "Unknown_Account"
 
-permissions:
-  contents: read
+# 获取每日一言
+def get_hitokoto():
+    try:
+        res = requests.get("https://v1.hitokoto.cn/?c=i", timeout=5).json()
+        return f"「{res['hitokoto']}」 —— {res['from']}"
+    except:
+        return "保持热爱，奔赴山海。"
 
-jobs:
-  renew:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+# TG 推送
+def send_tg(token, chat_id, message):
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[WARN] TG 推送失败: {e}")
 
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+# 核心执行逻辑
+def process_renew(cookie, proxy_dict):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Cookie": cookie,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    
+    account_name = mask_cookie(cookie)
+    log_content = f"👤 账号: `{account_name}`\n"
+    
+    try:
+        # 使用 impersonate="chrome120" 完美过 CF 验证
+        session = json_requests.Session()
+        if proxy_dict:
+            session.proxies = proxy_dict
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+        # 1. 获取账户信息与余额
+        dash_res = session.get("https://dash.hidencloud.com/api/user", headers=headers, impersonate="chrome120", timeout=15)
+        if dash_res.status_code != 200:
+            return f"❌ 账号 `{account_name}`: Cookie 已失效或遭遇阻断（状态码 {dash_res.status_code}）\n"
+        
+        user_data = dash_res.json()
+        balance = user_data.get("balance", "未知")
+        log_content += f"💰 账户余额: `{balance}` 元\n"
 
-      - name: Install Dependencies
-        run: |
-          pip install curl_cffi requests beautifulsoup4 pynacl
+        # 2. 执行续期操作 (调用续期 API，默认续期 7 天)
+        # 注意：这里根据 HidenCloud 的标准 Vhost/VPS 续期请求抓包重构
+        renew_res = session.post("https://dash.hidencloud.com/api/vps/renew", headers=headers, impersonate="chrome120", timeout=15)
+        renew_data = renew_res.json()
+        
+        if renew_data.get("success") or "成功" in renew_data.get("message", ""):
+            log_content += f"🔄 续期结果: `自动续期成功 (7天)`\n"
+        else:
+            log_content += f"🔄 续期结果: `未触发续期 ({renew_data.get('message', '未到续期时间')})`\n"
 
-      - name: Setup Xray Proxy Node
-        env:
-          PROXY_NODE: ${{ secrets.PROXY_NODE }}
-        run: |
-          if [ -z "$PROXY_NODE" ]; then
-            echo "[INFO] 未检测到 PROXY_NODE 变量，将采用直连模式运行。"
-            exit 0
-          fi
+        # 3. 自动扣费（检测未支付订单并用余额支付）
+        invoice_res = session.get("https://dash.hidencloud.com/api/invoices?status=unpaid", headers=headers, impersonate="chrome120", timeout=15)
+        invoices = invoice_res.json().get("data", [])
+        
+        if invoices:
+            log_content += f"🧾 检测到有 `{len(invoices)}` 个未支付订单，尝试自动扣费...\n"
+            for inv in invoices:
+                inv_id = inv.get("id")
+                pay_res = session.post(f"https://dash.hidencloud.com/api/invoices/{inv_id}/pay", json={"method": "balance"}, headers=headers, impersonate="chrome120", timeout=15)
+                pay_data = pay_res.json()
+                if pay_data.get("success"):
+                    log_content += f"  ✅ 订单 `#{inv_id}` 余额扣费成功！\n"
+                else:
+                    log_content += f"  ❌ 订单 `#{inv_id}` 扣费失败: `{pay_data.get('message', '余额不足')}`\n"
+        else:
+            log_content += f"🧾 扣费检测: `暂无未支付订单`\n"
 
-          echo "[INFO] 正在下载 Xray 核心..."
-          mkdir -p xray
-          curl -L -s https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
-          unzip -q xray.zip -d xray
-          chmod +x ./xray/xray
+    except Exception as e:
+        log_content += f"💥 运行异常: `{str(e)[:50]}`\n"
+    
+    return log_content + "\n"
 
-          echo "[INFO] 正在解析代理节点配置..."
-          python3 - << 'PYEOF'
-          import os, sys, json, base64
-          from urllib.parse import parse_qs, unquote
+def main():
+    raw_cookies = os.environ.get("HIDEN_COOKIE", "").strip()
+    tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    tg_chat_id = os.environ.get("TG_CHAT_ID", "").strip()
+    proxy_server = os.environ.get("PROXY_SERVER", "").strip()
 
-          url = os.environ.get("PROXY_NODE", "").strip()
-          if url.startswith("vless://"): protocol, content = "vless", url[8:]
-          elif url.startswith("vmess://"): protocol, content = "vmess", url[8:]
-          elif url.startswith("trojan://"): protocol, content = "trojan", url[9:]
-          elif url.startswith("ss://"): protocol, content = "ss", url[5:]
-          elif url.startswith("socks5://") or url.startswith("socks://"):
-              with open("use_external_socks.txt", "w") as f: f.write(url.split("#")[0])
-              sys.exit(0)
-          else: sys.exit(1)
+    if not raw_cookies:
+        print("[ERROR] 未配置 HIDEN_COOKIE")
+        sys.exit(1)
 
-          if "#" in content: content = content.rsplit("#", 1)[0]
-          config = {
-              "log": {"loglevel": "warning"},
-              "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks"}],
-              "outbounds": []
-          }
-          # 简易组装 outbound 逻辑
-          if protocol == "vless":
-              uuid, rest = content.split("@", 1)
-              host_port = rest.split("?", 1)[0] if "?" in rest else rest
-              address, port = host_port.rsplit(":", 1)
-              config["outbounds"].append({
-                  "protocol": "vless",
-                  "settings": {"vnext": [{"address": address, "port": int(port), "users": [{"id": uuid, "encryption": "none"}]}]}
-              })
-          # ... 其他协议解析维持原样组装至 config
-          with open("xray_config.json", "w") as f: json.dump(config, f)
-          PYEOF
+    # 解析多账号 (支持 & 或 换行符 分割)
+    cookie_list = [c.strip() for c in re.split(r'[&\n]', raw_cookies) if c.strip()]
+    print(f"[INFO] 成功载入 {len(cookie_list)} 个账号")
 
-          if [ -f "use_external_socks.txt" ]; then
-            echo "PROXY_SERVER=$(cat use_external_socks.txt | sed 's/socks5:\/\///')" >> $GITHUB_ENV
-            exit 0
-          fi
+    # 配置代理
+    proxy_dict = {}
+    if proxy_server:
+        proxy_dict = {"http": f"socks5://{proxy_server}", "https://f socks5://{proxy_server}"}
 
-          ./xray/xray run -c xray_config.json > xray.log 2>&1 &
-          sleep 3
-          echo "PROXY_SERVER=127.0.0.1:1080" >> $GITHUB_ENV
+    final_report = "📢 **HidenCloud 自动续费运行报告**\n\n"
+    for idx, cookie in enumerate(cookie_list, 1):
+        print(f"[INFO] 正在处理第 {idx}/{len(cookie_list)} 个账号...")
+        final_report += process_renew(cookie, proxy_dict)
+    
+    # 附带每日一言
+    final_report += f"--- \n🍃 {get_hitokoto()}"
+    
+    print(final_report)
+    send_tg(tg_token, tg_chat_id, final_report)
 
-      - name: Run HidenCloud Renew Script
-        env:
-          HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_SERVER: ${{ env.PROXY_SERVER }}
-        run: |
-          python hidencloud_renew.py
+if __name__ == "__main__":
+    main()
