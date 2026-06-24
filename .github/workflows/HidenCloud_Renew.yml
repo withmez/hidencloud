@@ -34,7 +34,7 @@ jobs:
         run: |
           pip install curl_cffi requests beautifulsoup4 pynacl
 
-            - name: 安装并启动代理
+      - name: 安装并启动代理
         env:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
         run: |
