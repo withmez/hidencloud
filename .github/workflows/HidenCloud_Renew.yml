@@ -1,196 +1,216 @@
-name: HidenCloud 自动续期
+name: HidenCloud 续期 (全协议代理增强版)
 
 on:
-  schedule:
-    - cron: '0 4 * * *'
   workflow_dispatch:
-
-concurrency:
-  group: hidencloud-renew
-  cancel-in-progress: false
+  schedule:
+    - cron: '13 3 4 5 *'    # 自动更新下次运行时间
 
 permissions:
-  contents: read
+  contents: write
   actions: write
-
-env:
-  PYTHONUNBUFFERED: "1"
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
-      - name: Checkout Code
+      - name: 拉取仓库代码
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 设置 Python 环境
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: 安装依赖
         run: |
-          pip install curl_cffi requests beautifulsoup4 pynacl
+          pip install --quiet seleniumbase requests beautifulsoup4
 
-      - name: 安装并启动代理
+      - name: 安装并启动 sing-box 代理 (清洗节点)
         env:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
         run: |
           if [ -z "$PROXY_NODE" ]; then
-            echo "[INFO] 未配置代理,直连模式"
+            echo "[INFO] 未配置代理，直连模式"
             exit 0
           fi
 
-          # Download and unzip the official Xray core
-          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          unzip -q Xray-linux-64.zip -d xray && chmod +x xray/xray
+          echo "[INFO] 发现自定义代理节点，开始下载全协议 sing-box 内核..."
+          # 下载官方最新稳定版 sing-box
+          SB_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -Po '"tag_name":\s*"\K[^"]*')
+          SB_VER_NUM=${SB_VERSION#v}
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/${SB_VERSION}/sing-box-${SB_VER_NUM}-linux-amd64.tar.gz"
+          tar -zxf sing-box-${SB_VER_NUM}-linux-amd64.tar.gz
+          mv sing-box-${SB_VER_NUM}-linux-amd64/sing-box . && chmod +x sing-box
 
+          # 调用内置 Python 脚本解析节点链接并生成无杂质的 sing-box 配置
           python3 << 'PYEOF'
-          import os
-          import sys
-          import json
-          import base64
+          import os, sys, json, base64
           from urllib.parse import parse_qs, unquote
-
-          def mask(s):
-              return f"{s[:2]}***{s[-2:]}" if len(s) > 4 else "****"
 
           url = os.environ.get("PROXY_NODE", "").strip()
           if not url:
               print("[ERROR] PROXY_NODE 为空")
               sys.exit(1)
 
-          protocol = url.split("://")[0]
-          content = url[len(protocol) + 3:]  # Adjust the slice based on the protocol length
-
           config = {
-              "log": {"loglevel": "warning"},
+              "log": {"level": "warn"},
               "inbounds": [
-                  {"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}},
-                  {"port": 1081, "listen": "127.0.0.1", "protocol": "http"}
+                  {"type": "mixed", "listen": "127.0.0.1", "listen_port": 1081} # 混合 SOCKS/HTTP 端口
               ],
               "outbounds": []
           }
 
-          if protocol == "vless":
+          outbound = {}
+
+          # 兼容 hy2:// 简写
+          if url.startswith("hy2://"):
+              url = url.replace("hy2://", "hysteria2://", 1)
+
+          # === 1. 解析 VLESS ===
+          if url.startswith("vless://"):
+              content = url[8:].split("#")[0]
               uuid, rest = content.split("@", 1)
               host_port, params_str = rest.split("?", 1) if "?" in rest else (rest, "")
-              address, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
+              server, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
               params = parse_qs(params_str)
-              security = params.get("security", ["none"])[0]
-              network = params.get("type", ["tcp"])[0]
-              sni = params.get("sni", [address])[0]
-              fp = params.get("fp", ["chrome"])[0]
-              path = unquote(params.get("path", ["/"])[0])
-              host = params.get("host", [""])[0]
-
-              print(f"[INFO] VLESS -> {mask(address)}:{port} (security: {security}, network: {network})")
 
               outbound = {
-                  "protocol": "vless",
-                  "settings": {
-                      "vnext": [{
-                          "address": address,
-                          "port": int(port),
-                          "users": [{"id": uuid, "encryption": "none"}]
-                      }]
-                  },
-                  "streamSettings": {
-                      "network": network,
-                      "security": security
+                  "type": "vless",
+                  "server": server,
+                  "server_port": int(port),
+                  "uuid": uuid,
+                  "flow": params.get("flow", [""])[0],
+                  "tls": {
+                      "enabled": True,
+                      "server_name": params.get("sni", [server])[0],
+                      "utls": {"enabled": True, "fingerprint": params.get("fp", ["chrome"])[0]}
                   }
               }
-
-              # 核心修复 1：动态补全 TLS 与 SNI 配置
-              if security == "tls":
-                  outbound["streamSettings"]["tlsSettings"] = {
-                      "serverName": sni if sni else address,
-                      "fingerprint": fp
+              if params.get("security", ["none"])[0] == "reality":
+                  outbound["tls"]["reality"] = {
+                      "enabled": True,
+                      "public_key": params.get("pbk", [""])[0],
+                      "short_id": params.get("sid", [""])[0]
+                  }
+              net = params.get("type", ["tcp"])[0]
+              if net == "ws":
+                  outbound["transport"] = {
+                      "type": "ws",
+                      "path": unquote(params.get("path", ["/"])[0]).split("?")[0], # 过滤多余参数
+                      "headers": {"Host": params.get("host", [server])[0]}
                   }
 
-              # 核心修复 2：动态补全 xhttp 核心传输设置
-              if network == "xhttp":
-                  outbound["streamSettings"]["xhttpSettings"] = {
-                      "path": path,
-                      "host": host if host else (sni if sni else address)
+          # === 2. 解析 VMESS ===
+          elif url.startswith("vmess://"):
+              content = url[8:].split("#")[0]
+              padding = 4 - len(content) % 4
+              if padding != 4: content += "=" * padding
+              vm = json.loads(base64.b64decode(content).decode("utf-8"))
+              
+              outbound = {
+                  "type": "vmess",
+                  "server": vm.get("add"),
+                  "server_port": int(vm.get("port", 443)),
+                  "uuid": vm.get("id"),
+                  "security": "auto",
+                  "alter_id": int(vm.get("aid", 0))
+              }
+              if vm.get("tls") == "tls":
+                  outbound["tls"] = {
+                      "enabled": True,
+                      "server_name": vm.get("sni") or vm.get("host") or vm.get("add"),
+                      "utls": {"enabled": True, "fingerprint": vm.get("fp", "chrome")}
                   }
-              elif network == "ws":
-                  outbound["streamSettings"]["wsSettings"] = {
-                      "path": path,
-                      "headers": {"Host": host} if host else {}
+              if vm.get("net") == "ws":
+                  outbound["transport"] = {
+                      "type": "ws",
+                      "path": vm.get("path", "/").split("?")[0], # 过滤多余参数
+                      "headers": {"Host": vm.get("host") or vm.get("add")}
                   }
 
-              config["outbounds"].append(outbound)
-
-          elif protocol == "vmess":
-              # Existing VMess handling logic goes here...
-              pass
-
-          elif protocol == "trojan":
-              # Existing Trojan handling logic goes here...
-              pass
-
-          elif protocol == "ss":
-              # Existing Shadowsocks handling logic goes here...
-              pass
-
-          elif protocol == "hy2" or protocol == "hysteria":
+          # === 3. 解析 HYSTERIA 2 ===
+          elif url.startswith("hysteria2://"):
+              content = url[12:].split("#")[0]
               password, rest = content.split("@", 1)
-              if "?" in rest:
-                  host_port, params_str = rest.split("?", 1)
-              else:
-                  host_port, params_str = rest, ""
-
-              address, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
+              host_port, params_str = rest.split("?", 1) if "?" in rest else (rest, "")
+              server, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
               params = parse_qs(params_str)
-              sni = params.get("sni", [address])[0]
-              network = params.get("type", ["tcp"])[0]
-              fp = params.get("fp", ["chrome"])[0]
-
-              print(f"[INFO] Hysteria -> {mask(address)}:{port} (network: {network})")
 
               outbound = {
-                  "protocol": "hysteria",
-                  "settings": {
-                      "servers": [{
-                          "address": address,
-                          "port": int(port),
-                          "password": password
-                      }]
-                  },
-                  "streamSettings": {
-                      "network": network,
-                      "security": "tls"
+                  "type": "hysteria2",
+                  "server": server,
+                  "server_port": int(port),
+                  "password": password,
+                  "tls": {
+                      "enabled": True,
+                      "server_name": params.get("sni", [server])[0],
+                      "insecure": params.get("insecure", ["0"])[0] == "1"
                   }
               }
-              config["outbounds"].append(outbound)
 
-          # Write the generated configuration to xray_config.json
-          with open("xray_config.json", "w") as f:
+          # === 4. 解析 TROJAN ===
+          elif url.startswith("trojan://"):
+              content = url[9:].split("#")[0]
+              password, rest = content.split("@", 1)
+              host_port, params_str = rest.split("?", 1) if "?" in rest else (rest, "")
+              server, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
+              params = parse_qs(params_str)
+
+              outbound = {
+                  "type": "trojan",
+                  "server": server,
+                  "server_port": int(port),
+                  "password": password,
+                  "tls": {
+                      "enabled": True,
+                      "server_name": params.get("sni", [server])[0]
+                  }
+              }
+
+          # === 5. 解析 SHADOWSOCKS ===
+          elif url.startswith("ss://"):
+              content = url[5:].split("#")[0]
+              if "@" in content:
+                  user_info, server_info = content.split("@", 1)
+                  padding = 4 - len(user_info) % 4
+                  if padding != 4: user_info += "=" * padding
+                  method, password = base64.b64decode(user_info).decode("utf-8").split(":", 1)
+                  server, port = server_info.split(":", 1)
+              else:
+                  padding = 4 - len(content) % 4
+                  if padding != 4: content += "=" * padding
+                  decoded = base64.b64decode(content).decode("utf-8")
+                  user_info, server_info = decoded.split("@", 1)
+                  method, password = user_info.split(":", 1)
+                  server, port = server_info.split(":", 1)
+
+              outbound = {
+                  "type": "shadowsocks",
+                  "server": server,
+                  "server_port": int(port),
+                  "method": method,
+                  "password": password
+              }
+
+          else:
+              print(f"[ERROR] 不支持的节点协议: {url}")
+              sys.exit(1)
+
+          config["outbounds"].append(outbound)
+          with open("sing_config.json", "w") as f:
               json.dump(config, f, indent=2)
-
-          print("[INFO] ✅ 代理配置已生成")
+          print("[INFO] ✅ sing-box 清洗后的配置已生成")
           PYEOF
 
-          # Check for the external SOCKS proxy
-          if [ -f "use_external_socks.txt" ]; then
-            EXTERNAL_SOCKS=$(cat use_external_socks.txt)
-            echo "PROXY_SERVER=$EXTERNAL_SOCKS" >> $GITHUB_ENV
-            echo "[INFO] ✅ 使用外部 SOCKS5 代理"
-            exit 0
-          fi
-
-          ./xray/xray run -c xray_config.json > xray.log 2>&1 &
-          sleep 5
+          ./sing-box run -c sing_config.json > singbox.log 2>&1 &
+          sleep 4
 
           echo "[INFO] 测试代理连接..."
-          for i in {1..5}; do
-            # 核心修复 3：更换为更轻量的连通性测试端点
-            if curl -x socks5://127.0.0.1:1080 -s --max-time 15 http://cp.cloudflare.com/generate_204 > /dev/null 2>&1; then
+          for i in 1 2 3 4 5; do
+            if curl -x http://127.0.0.1:1081 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
               echo "[INFO] ✅ 代理连接成功"
-              echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+              echo "PROXY_SERVER=http://127.0.0.1:1081" >> $GITHUB_ENV
               exit 0
             fi
             echo "[WARN] 尝试 $i/5..."
@@ -198,23 +218,130 @@ jobs:
           done
 
           echo "[ERROR] ❌ 代理连接失败"
-          cat xray.log
+          cat singbox.log
           exit 1
 
-      - name: Run HidenCloud Renew Script
+      - name: 恢复浏览器状态缓存
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: browser_state
+          key: hidencloud-state-${{ github.run_id }}
+          restore-keys: |
+            hidencloud-state-
+
+      - name: 清理 Chrome 锁文件
+        run: |
+          PROFILE_DIR="browser_state/selenium_profile"
+          if [ -d "$PROFILE_DIR" ]; then
+            echo "🧹 清理浏览器锁文件..."
+            find "$PROFILE_DIR" -name "SingletonLock" -delete 2>/dev/null || true
+            find "$PROFILE_DIR" -name "SingletonSocket" -delete 2>/dev/null || true
+            find "$PROFILE_DIR" -name "SingletonCookie" -delete 2>/dev/null || true
+            echo "✅ 清理完成"
+          else
+            echo "📂 用户数据目录不存在，无需清理"
+          fi
+
+      - name: 运行续期脚本
+        id: run_renew
         env:
-          HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
+          HIDENCLOUD: ${{ secrets.HIDENCLOUD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: |
-          python hidencloud_renew.py
+          python3 main.py 2>&1 | tee renew.log
 
-      - name: Delete Old Workflow Runs
+      - name: 删除旧浏览器状态缓存
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "🗑️ 清理旧缓存..."
+          PREFIX="hidencloud-state-"
+          CACHE_KEYS=$(gh cache list --limit 100 --json key -q '.[].key' --repo ${{ github.repository }} | grep "^${PREFIX}" || true)
+
+          if [ -z "$CACHE_KEYS" ]; then
+            echo "没有找到旧缓存"
+          else
+            for key in $CACHE_KEYS; do
+              echo "删除: $key"
+              gh cache delete "$key" --repo ${{ github.repository }} || true
+            done
+            echo "✅ 旧缓存清理完成"
+          fi
+
+      - name: 保存浏览器状态缓存
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: browser_state
+          key: hidencloud-state-${{ github.run_id }}
+
+      - name: 提取到期时间
+        id: extract_due
+        if: success()
+        run: |
+          DUE_DATE=$(grep -oP '到期时间\(标准\): \K\d{4}-\d{2}-\d{2}' renew.log | tail -1 || echo "")
+          if [ -z "$DUE_DATE" ]; then
+            echo "skip_update=true" >> $GITHUB_OUTPUT
+            echo "::warning::未能提取到期时间，跳过 Cron 更新"
+            exit 0
+          fi
+          echo "due_date=$DUE_DATE" >> $GITHUB_OUTPUT
+          echo "skip_update=false" >> $GITHUB_OUTPUT
+          echo "::notice::📅 当前到期时间: $DUE_DATE"
+
+      - name: 修改下次 Cron 时间
+        if: success() && steps.extract_due.outputs.skip_update != 'true'
+        run: |
+          set -e
+          DUE_DATE="${{ steps.extract_due.outputs.due_date }}"
+          CURRENT_EPOCH=$(date -u +%s)
+          DUE_EPOCH=$(date -u -d "$DUE_DATE 00:00:00" +%s)
+          REMAINING_SECONDS=$((DUE_EPOCH - CURRENT_EPOCH))
+          REMAINING_HOURS_INT=$((REMAINING_SECONDS / 3600))
+
+          if [ "$REMAINING_HOURS_INT" -gt 20 ]; then
+            HOURS_UNTIL_NEXT_RUN=$((REMAINING_HOURS_INT - 20))
+          else
+            HOURS_UNTIL_NEXT_RUN=4
+            echo "::warning::剩余时间不足 20 小时，4 小时后重试"
+          fi
+
+          NEXT_MINUTE=$(date -u -d "+${HOURS_UNTIL_NEXT_RUN} hours" +"%-M")
+          NEXT_HOUR=$(date -u -d "+${HOURS_UNTIL_NEXT_RUN} hours" +"%-H")
+          NEXT_DAY=$(date -u -d "+${HOURS_UNTIL_NEXT_RUN} hours" +"%-d")
+          NEXT_MONTH=$(date -u -d "+${HOURS_UNTIL_NEXT_RUN} hours" +"%-m")
+
+          NEW_CRON="$NEXT_MINUTE $NEXT_HOUR $NEXT_DAY $NEXT_MONTH *"
+
+          git clone https://x-access-token:${{ secrets.REPO_TOKEN }}@github.com/${{ github.repository }}.git workflow_repo
+          cd workflow_repo
+
+          WORKFLOW_FILE=".github/workflows/HidenCloud_Renew.yml"
+          LINE_NUM=$(grep -n "cron: '" "$WORKFLOW_FILE" | head -n1 | cut -d: -f1)
+
+          sed -i "${LINE_NUM}c\\    - cron: '$NEW_CRON'    # 自动更新下次运行时间" "$WORKFLOW_FILE"
+
+          if git diff --quiet "$WORKFLOW_FILE"; then
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$WORKFLOW_FILE"
+          git commit -m "🔄 自动更新 HidenCloud 续期 Cron"
+          git push
+
+      - name: 清理运行记录
+        if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
           retain_days: 0
-          keep_minimum_runs: 5
+          keep_minimum_runs: 2
