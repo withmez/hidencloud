@@ -1,62 +1,77 @@
-name: HidenCloud 续期 (全协议代理增强版)
+name: HidenCloud 自动续期
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '13 3 4 5 *'    # 自动更新下次运行时间
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: hidencloud-renew
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
   actions: write
+
+env:
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   renew:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: 拉取仓库代码
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: 设置 Python 环境
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
-      - name: 安装依赖
+      - name: Install Dependencies
         run: |
-          pip install --quiet seleniumbase requests beautifulsoup4
+          pip install curl_cffi requests beautifulsoup4 pynacl
 
-      - name: 安装并启动 sing-box 代理 (清洗节点)
+      - name: 安装并启动代理
         env:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
         run: |
           if [ -z "$PROXY_NODE" ]; then
-            echo "[INFO] 未配置代理，直连模式"
+            echo "[INFO] 未配置代理,直连模式"
             exit 0
           fi
 
-          echo "[INFO] 发现自定义代理节点，开始下载全协议 sing-box 内核..."
-          # 下载官方最新稳定版 sing-box
+          echo "[INFO] 发现 PROXY_NODE，开始下载全协议 sing-box 内核..."
+          # 下载官方最新稳定版 sing-box (完美支持 vmess/vless/ss/trojan/hy2)
           SB_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -Po '"tag_name":\s*"\K[^"]*')
           SB_VER_NUM=${SB_VERSION#v}
           wget -q "https://github.com/SagerNet/sing-box/releases/download/${SB_VERSION}/sing-box-${SB_VER_NUM}-linux-amd64.tar.gz"
           tar -zxf sing-box-${SB_VER_NUM}-linux-amd64.tar.gz
           mv sing-box-${SB_VER_NUM}-linux-amd64/sing-box . && chmod +x sing-box
 
-          # 调用内置 Python 脚本解析节点链接并生成无杂质的 sing-box 配置
           python3 << 'PYEOF'
-          import os, sys, json, base64
+          import os
+          import sys
+          import json
+          import base64
           from urllib.parse import parse_qs, unquote
+
+          def mask(s):
+              return f"{s[:2]}***{s[-2:]}" if len(s) > 4 else "****"
 
           url = os.environ.get("PROXY_NODE", "").strip()
           if not url:
               print("[ERROR] PROXY_NODE 为空")
               sys.exit(1)
 
+          # 初始化基础 sing-box 骨架（提供 HTTP 1081 和 SOCKS5 1080 监听，完美对齐原 YML 端口）
           config = {
               "log": {"level": "warn"},
               "inbounds": [
-                  {"type": "mixed", "listen": "127.0.0.1", "listen_port": 1081} # 混合 SOCKS/HTTP 端口
+                  {"type": "socks", "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http", "listen": "127.0.0.1", "listen_port": 1081}
               ],
               "outbounds": []
           }
@@ -75,6 +90,7 @@ jobs:
               server, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
               params = parse_qs(params_str)
 
+              print(f"[INFO] VLESS -> {mask(server)}:{port}")
               outbound = {
                   "type": "vless",
                   "server": server,
@@ -108,6 +124,7 @@ jobs:
               if padding != 4: content += "=" * padding
               vm = json.loads(base64.b64decode(content).decode("utf-8"))
               
+              print(f"[INFO] VMESS -> {mask(vm.get('add'))}:{vm.get('port')}")
               outbound = {
                   "type": "vmess",
                   "server": vm.get("add"),
@@ -125,11 +142,11 @@ jobs:
               if vm.get("net") == "ws":
                   outbound["transport"] = {
                       "type": "ws",
-                      "path": vm.get("path", "/").split("?")[0], # 过滤多余参数
+                      "path": vm.get("path", "/").split("?")[0],
                       "headers": {"Host": vm.get("host") or vm.get("add")}
                   }
 
-          # === 3. 解析 HYSTERIA 2 ===
+          # === 3. 解析 HYSTERIA 2 / HY2 ===
           elif url.startswith("hysteria2://"):
               content = url[12:].split("#")[0]
               password, rest = content.split("@", 1)
@@ -137,6 +154,7 @@ jobs:
               server, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
               params = parse_qs(params_str)
 
+              print(f"[INFO] Hysteria2 -> {mask(server)}:{port}")
               outbound = {
                   "type": "hysteria2",
                   "server": server,
@@ -157,6 +175,7 @@ jobs:
               server, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
               params = parse_qs(params_str)
 
+              print(f"[INFO] Trojan -> {mask(server)}:{port}")
               outbound = {
                   "type": "trojan",
                   "server": server,
@@ -185,6 +204,7 @@ jobs:
                   method, password = user_info.split(":", 1)
                   server, port = server_info.split(":", 1)
 
+              print(f"[INFO] Shadowsocks -> {mask(server)}:{port}")
               outbound = {
                   "type": "shadowsocks",
                   "server": server,
@@ -200,17 +220,27 @@ jobs:
           config["outbounds"].append(outbound)
           with open("sing_config.json", "w") as f:
               json.dump(config, f, indent=2)
-          print("[INFO] ✅ sing-box 清洗后的配置已生成")
+
+          print("[INFO] ✅ sing-box 清洗配置已成功转换")
           PYEOF
 
+          # 检查外部代理白名单逻辑
+          if [ -f "use_external_socks.txt" ]; then
+            EXTERNAL_SOCKS=$(cat use_external_socks.txt)
+            echo "PROXY_SERVER=$EXTERNAL_SOCKS" >> $GITHUB_ENV
+            echo "[INFO] ✅ 使用外部 SOCKS5 代理"
+            exit 0
+          fi
+
+          # 启动后台 sing-box 进程
           ./sing-box run -c sing_config.json > singbox.log 2>&1 &
-          sleep 4
+          sleep 5
 
           echo "[INFO] 测试代理连接..."
-          for i in 1 2 3 4 5; do
-            if curl -x http://127.0.0.1:1081 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
+          for i in {1..5}; do
+            if curl -x socks5://127.0.0.1:1080 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
               echo "[INFO] ✅ 代理连接成功"
-              echo "PROXY_SERVER=http://127.0.0.1:1081" >> $GITHUB_ENV
+              echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
               exit 0
             fi
             echo "[WARN] 尝试 $i/5..."
@@ -221,127 +251,21 @@ jobs:
           cat singbox.log
           exit 1
 
-      - name: 恢复浏览器状态缓存
-        id: cache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: browser_state
-          key: hidencloud-state-${{ github.run_id }}
-          restore-keys: |
-            hidencloud-state-
-
-      - name: 清理 Chrome 锁文件
-        run: |
-          PROFILE_DIR="browser_state/selenium_profile"
-          if [ -d "$PROFILE_DIR" ]; then
-            echo "🧹 清理浏览器锁文件..."
-            find "$PROFILE_DIR" -name "SingletonLock" -delete 2>/dev/null || true
-            find "$PROFILE_DIR" -name "SingletonSocket" -delete 2>/dev/null || true
-            find "$PROFILE_DIR" -name "SingletonCookie" -delete 2>/dev/null || true
-            echo "✅ 清理完成"
-          else
-            echo "📂 用户数据目录不存在，无需清理"
-          fi
-
-      - name: 运行续期脚本
-        id: run_renew
+      - name: Run HidenCloud Renew Script
         env:
-          HIDENCLOUD: ${{ secrets.HIDENCLOUD }}
+          HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: |
-          python3 main.py 2>&1 | tee renew.log
+          python hidencloud_renew.py
 
-      - name: 删除旧浏览器状态缓存
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "🗑️ 清理旧缓存..."
-          PREFIX="hidencloud-state-"
-          CACHE_KEYS=$(gh cache list --limit 100 --json key -q '.[].key' --repo ${{ github.repository }} | grep "^${PREFIX}" || true)
-
-          if [ -z "$CACHE_KEYS" ]; then
-            echo "没有找到旧缓存"
-          else
-            for key in $CACHE_KEYS; do
-              echo "删除: $key"
-              gh cache delete "$key" --repo ${{ github.repository }} || true
-            done
-            echo "✅ 旧缓存清理完成"
-          fi
-
-      - name: 保存浏览器状态缓存
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: browser_state
-          key: hidencloud-state-${{ github.run_id }}
-
-      - name: 提取到期时间
-        id: extract_due
-        if: success()
-        run: |
-          DUE_DATE=$(grep -oP '到期时间\(标准\): \K\d{4}-\d{2}-\d{2}' renew.log | tail -1 || echo "")
-          if [ -z "$DUE_DATE" ]; then
-            echo "skip_update=true" >> $GITHUB_OUTPUT
-            echo "::warning::未能提取到期时间，跳过 Cron 更新"
-            exit 0
-          fi
-          echo "due_date=$DUE_DATE" >> $GITHUB_OUTPUT
-          echo "skip_update=false" >> $GITHUB_OUTPUT
-          echo "::notice::📅 当前到期时间: $DUE_DATE"
-
-      - name: 修改下次 Cron 时间
-        if: success() && steps.extract_due.outputs.skip_update != 'true'
-        run: |
-          set -e
-          DUE_DATE="${{ steps.extract_due.outputs.due_date }}"
-          CURRENT_EPOCH=$(date -u +%s)
-          DUE_EPOCH=$(date -u -d "$DUE_DATE 00:00:00" +%s)
-          REMAINING_SECONDS=$((DUE_EPOCH - CURRENT_EPOCH))
-          REMAINING_HOURS_INT=$((REMAINING_SECONDS / 3600))
-
-          if [ "$REMAINING_HOURS_INT" -gt 20 ]; then
-            HOURS_UNTIL_NEXT_RUN=$((REMAINING_HOURS_INT - 20))
-          else
-            HOURS_UNTIL_NEXT_RUN=4
-            echo "::warning::剩余时间不足 20 小时，4 小时后重试"
-          fi
-
-          NEXT_MINUTE=$(date -u -d "+${HOURS_UNTIL_NEXT_RUN} hours" +"%-M")
-          NEXT_HOUR=$(date -u -d "+${HOURS_UNTIL_NEXT_RUN} hours" +"%-H")
-          NEXT_DAY=$(date -u -d "+${HOURS_UNTIL_NEXT_RUN} hours" +"%-d")
-          NEXT_MONTH=$(date -u -d "+${HOURS_UNTIL_NEXT_RUN} hours" +"%-m")
-
-          NEW_CRON="$NEXT_MINUTE $NEXT_HOUR $NEXT_DAY $NEXT_MONTH *"
-
-          git clone https://x-access-token:${{ secrets.REPO_TOKEN }}@github.com/${{ github.repository }}.git workflow_repo
-          cd workflow_repo
-
-          WORKFLOW_FILE=".github/workflows/HidenCloud_Renew.yml"
-          LINE_NUM=$(grep -n "cron: '" "$WORKFLOW_FILE" | head -n1 | cut -d: -f1)
-
-          sed -i "${LINE_NUM}c\\    - cron: '$NEW_CRON'    # 自动更新下次运行时间" "$WORKFLOW_FILE"
-
-          if git diff --quiet "$WORKFLOW_FILE"; then
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$WORKFLOW_FILE"
-          git commit -m "🔄 自动更新 HidenCloud 续期 Cron"
-          git push
-
-      - name: 清理运行记录
-        if: always()
+      - name: Delete Old Workflow Runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          delete_workflow_pattern: ${{ github.workflow }}
           retain_days: 0
-          keep_minimum_runs: 2
+          keep_minimum_runs: 5
