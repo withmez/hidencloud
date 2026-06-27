@@ -455,6 +455,26 @@ def main():
         logger.info(f"检测到代理: {proxy_server}")
         proxies = {"http": proxy_server, "https": proxy_server}
 
+    # ======== 🕵️ 代理质量与脚本隔离测试 ========
+        logger.info("====== 🕵️ 开始执行代理质量排查 ======")
+        try:
+            # 1. 测试常规国际公网是否畅通
+            test_pub = requests.get("https://cp.cloudflare.com/generate_204", proxies=proxies, timeout=10)
+            logger.info(f"🟢 [基础网络] 节点本身正常，可连接外网 (状态码: {test_pub.status_code})")
+            
+            # 2. 测试目标网站 HidenCloud 是否对该节点阻断
+            test_target = requests.get("https://dash.hidencloud.com/dashboard", proxies=proxies, timeout=15, impersonate="chrome110")
+            logger.info(f"🟢 [目标面板] 节点成功握手 HidenCloud 官网 (状态码: {test_target.status_code})")
+            logger.info("👉 结论：节点完美通行！若后续报错，则是 Cookie、解析或业务逻辑问题。")
+        except Exception as e:
+            logger.error(f"🔴 [测试失败] 代理请求出现异常。详细错误: {e}")
+            if "timeout" in str(e).lower() or "28" in str(e):
+                logger.info("👉 结论：节点 IP 极大概率已被 HidenCloud 防御系统/Cloudflare 彻底拉黑（流量被丢弃）。请更换 PROXY_NODE！")
+            else:
+                logger.info("👉 结论：Xray 代理隧道可能未成功建立，请检查 YML 中的节点参数（Path/UUID/TLS）是否正确。")
+        logger.info("====================================")
+        # ==========================================
+
     # 并发执行
     with ThreadPoolExecutor(max_workers=min(len(config_cookies), 5)) as pool:
         futs = {}
