@@ -34,22 +34,24 @@ jobs:
         run: |
           pip install curl_cffi requests beautifulsoup4 pynacl
 
-           - name: 解析 PROXY_NODE 并自适应部署内核
+      - name: 解析 PROXY_NODE 并自适应部署内核
         env:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
         run: |
+          # Check if PROXY_NODE is set
           if [ -z "${PROXY_NODE}" ]; then
             echo "[INFO] 未检测到 PROXY_NODE 变量,系统将采用纯直连模式运行。"
             echo "FINAL_PROXY=" >> $GITHUB_ENV
             exit 0
           fi
 
-          # 提取协议前缀并转换为小写
-          PROTO=$(echo "${PROXY_NODE}" | awk -F'://' '{print $1}' | tr 'A-Z' 'a-z')
+          # Convert protocol prefix to lowercase
+          PROTO=$(echo "${PROXY_NODE}" | awk -F'://' '{print tolower($1)}')
           echo "[INFO] 检测到私有代理协议: ${PROTO}"
 
           LOCAL_PROXY="socks5://127.0.0.1:1080"
 
+          # Deploy based on the protocol
           case "${PROTO}" in
             vless|vmess|trojan|ss)
               echo "[INFO] 正在部署 Xray-core 守护进程..."
@@ -58,8 +60,8 @@ jobs:
               sudo mkdir -p /usr/local/share/xray /usr/local/bin
               sudo unzip -q /tmp/xray.zip -d /usr/local/share/xray
               sudo ln -s /usr/local/share/xray/xray /usr/local/bin/xray
-              
-              # 生成 Xray 桥接分流配置
+
+              # Generate Xray configuration
               cat << EOF > ./xray_config.json
               {
                 "inbounds": [{
@@ -83,13 +85,13 @@ jobs:
               curl -L -H "Cache-Control: no-cache" -o /tmp/hysteria "https://github.com/apernet/hysteria/releases/download/${HY2_LATEST}/hysteria-linux-amd64"
               sudo chmod +x /tmp/hysteria
               sudo mv /tmp/hysteria /usr/local/bin/hysteria
-              
-              # 生成 Hysteria2 桥接分流配置
+
+              # Generate Hysteria2 configuration
               cat << EOF > ./hy2_config.yaml
               socks5:
                 listen: 127.0.0.1:1080
               EOF
-              
+
               nohup hysteria client -c ./hy2_config.yaml > ./hy2.log 2>&1 &
               echo "FINAL_PROXY=${LOCAL_PROXY}" >> $GITHUB_ENV
               echo "[INFO] Hysteria2 已在后台网闸端口 1080 挂载。"
@@ -105,6 +107,7 @@ jobs:
               echo "FINAL_PROXY=" >> $GITHUB_ENV
               ;;
           esac
+
       - name: Run HidenCloud Renew Script
         env:
           HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
