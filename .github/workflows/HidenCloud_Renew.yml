@@ -84,6 +84,7 @@ jobs:
               sni = params.get("sni", [address])[0]
               fp = params.get("fp", ["chrome"])[0]
               path = unquote(params.get("path", ["/"])[0])
+              host = params.get("host", [""])[0]
 
               print(f"[INFO] VLESS -> {mask(address)}:{port} (security: {security}, network: {network})")
 
@@ -101,6 +102,26 @@ jobs:
                       "security": security
                   }
               }
+
+              # 核心修复 1：动态补全 TLS 与 SNI 配置
+              if security == "tls":
+                  outbound["streamSettings"]["tlsSettings"] = {
+                      "serverName": sni if sni else address,
+                      "fingerprint": fp
+                  }
+
+              # 核心修复 2：动态补全 xhttp 核心传输设置
+              if network == "xhttp":
+                  outbound["streamSettings"]["xhttpSettings"] = {
+                      "path": path,
+                      "host": host if host else (sni if sni else address)
+                  }
+              elif network == "ws":
+                  outbound["streamSettings"]["wsSettings"] = {
+                      "path": path,
+                      "headers": {"Host": host} if host else {}
+                  }
+
               config["outbounds"].append(outbound)
 
           elif protocol == "vmess":
@@ -116,7 +137,6 @@ jobs:
               pass
 
           elif protocol == "hy2" or protocol == "hysteria":
-              # Hysteria handling logic
               password, rest = content.split("@", 1)
               if "?" in rest:
                   host_port, params_str = rest.split("?", 1)
@@ -142,7 +162,7 @@ jobs:
                   },
                   "streamSettings": {
                       "network": network,
-                      "security": "tls"  # Default to TLS; customize as needed
+                      "security": "tls"
                   }
               }
               config["outbounds"].append(outbound)
@@ -167,7 +187,8 @@ jobs:
 
           echo "[INFO] 测试代理连接..."
           for i in {1..5}; do
-            if curl -x socks5://127.0.0.1:1080 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
+            # 核心修复 3：更换为更轻量的连通性测试端点
+            if curl -x socks5://127.0.0.1:1080 -s --max-time 15 http://cp.cloudflare.com/generate_204 > /dev/null 2>&1; then
               echo "[INFO] ✅ 代理连接成功"
               echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
               exit 0
