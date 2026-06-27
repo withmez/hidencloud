@@ -46,7 +46,7 @@ jobs:
           fi
 
           # Convert protocol prefix to lowercase
-          PROTO=$(echo "${PROXY_NODE}" | awk -F'://' '{print tolower($1)}')
+          PROTO=$(echo "${PROXY_NODE}" | awk -F '://' '{print tolower($1)}')
           echo "[INFO] 检测到私有代理协议: ${PROTO}"
 
           LOCAL_PROXY="socks5://127.0.0.1:1080"
@@ -62,7 +62,7 @@ jobs:
               sudo ln -s /usr/local/share/xray/xray /usr/local/bin/xray
 
               # Generate Xray configuration
-              cat << EOF > ./xray_config.json
+              cat <<EOF > ./xray_config.json
               {
                 "inbounds": [{
                   "port": 1080,
@@ -73,7 +73,7 @@ jobs:
                   "protocol": "freedom"
                 }]
               }
-              EOF
+          EOF
               nohup xray -c ./xray_config.json > ./xray.log 2>&1 &
               echo "FINAL_PROXY=${LOCAL_PROXY}" >> $GITHUB_ENV
               echo "[INFO] Xray-core 已在后台网闸端口 1080 挂载。"
@@ -87,16 +87,16 @@ jobs:
               sudo mv /tmp/hysteria /usr/local/bin/hysteria
 
               # Generate Hysteria2 configuration
-              cat << EOF > ./hy2_config.yaml
+              cat <<EOF > ./hy2_config.yaml
               socks5:
                 listen: 127.0.0.1:1080
-              EOF
-
+            EOF
+              
               nohup hysteria client -c ./hy2_config.yaml > ./hy2.log 2>&1 &
               echo "FINAL_PROXY=${LOCAL_PROXY}" >> $GITHUB_ENV
               echo "[INFO] Hysteria2 已在后台网闸端口 1080 挂载。"
               ;;
-              
+            
             socks|socks5)
               echo "[INFO] 检测为标准原生态 SOCKS5 代理,直接透传。"
               echo "FINAL_PROXY=${PROXY_NODE}" >> $GITHUB_ENV
@@ -107,7 +107,7 @@ jobs:
               echo "FINAL_PROXY=" >> $GITHUB_ENV
               ;;
           esac
-
+          
       - name: Run HidenCloud Renew Script
         env:
           HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
